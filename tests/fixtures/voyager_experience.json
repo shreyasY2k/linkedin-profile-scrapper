@@ -1,0 +1,62 @@
+{
+  "data": {
+    "entityUrn": "urn:li:fsd_profilePositionCollection:SYNTHETIC",
+    "paging": {
+      "count": 10,
+      "start": 0,
+      "links": [],
+      "total": 2
+    },
+    "*elements": [
+      "urn:li:fsd_profilePosition:(SYNTHETIC,1)",
+      "urn:li:fsd_profilePosition:(SYNTHETIC,2)"
+    ],
+    "$type": "com.linkedin.restli.common.CollectionResponse"
+  },
+  "included": [
+    {
+      "entityUrn": "urn:li:fsd_profilePosition:(SYNTHETIC,2)",
+      "title": "Placeholder Developer",
+      "companyName": "Test Industries",
+      "companyUrn": "urn:li:fsd_company:900002",
+      "employmentTypeUrn": "urn:li:fsd_employmentType:2",
+      "locationName": "Remote",
+      "geoLocationName": "Remote",
+      "description": "An earlier synthetic role, with both ends bounded.",
+      "dateRange": {
+        "start": {
+          "month": 7,
+          "year": 2020,
+          "$type": "com.linkedin.common.Date"
+        },
+        "end": {
+          "month": 2,
+          "year": 2023,
+          "$type": "com.linkedin.common.Date"
+        },
+        "$type": "com.linkedin.common.DateRange"
+      },
+      "$type": "com.linkedin.voyager.dash.identity.profile.Position"
+    },
+    {
+      "entityUrn": "urn:li:fsd_profilePosition:(SYNTHETIC,1)",
+      "title": "Synthetic Fixture Engineer",
+      "companyName": "Example Robotics",
+      "companyUrn": "urn:li:fsd_company:900001",
+      "employmentTypeUrn": "urn:li:fsd_employmentType:1",
+      "locationName": "Placeholder City, Testland",
+      "geoLocationName": "Placeholder City, Testland",
+      "geoUrn": "urn:li:fsd_geo:100000000",
+      "description": "Writes fixtures that are not real people.",
+      "dateRange": {
+        "start": {
+          "month": 3,
+          "year": 2023,
+          "$type": "com.linkedin.common.Date"
+        },
+        "$type": "com.linkedin.common.DateRange"
+      },
+      "$type": "com.linkedin.voyager.dash.identity.profile.Position"
+    }
+  ]
+}

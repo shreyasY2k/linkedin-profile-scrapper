@@ -2,7 +2,7 @@
 title: 'Voyager client returning raw profile JSON'
 type: 'feature'
 created: '2026-08-27'
-status: 'in-progress'
+status: 'implemented'
 baseline_commit: '7b36c08d9523ce9266434cb105d25450a7d99a7b'
 review_loop_iteration: 0
 context:
@@ -94,13 +94,13 @@ Date precision falls out of the source exactly as `response-schema.md` requires:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `app/config.py` — optional developer cookie setting, excluded from any repr or log output
-- [ ] `.env.example` — document it as optional and developer-only
-- [ ] `app/linkedin/client.py` — the client: URL parsing, the single request choke point, URN resolution, the six-call fan-out
-- [ ] `app/errors.py` — add the upstream codes from the matrix to story 3's existing table
-- [ ] `tests/test_linkedin_client.py` — every matrix row against synthetic fixtures, no network
-- [ ] `tests/fixtures/` — redacted or synthetic payloads mirroring the real entity shapes; assert no fixture contains a real cookie or a third party's data
-- [ ] one live check — the developer's own profile only, asserting all six resources return, kept out of the default test run so CI and graders never hit LinkedIn
+- [x] `app/config.py` — optional developer cookie setting, excluded from any repr or log output
+- [x] `.env.example` — document it as optional and developer-only
+- [x] `app/linkedin/client.py` — the client: URL parsing, the single request choke point, URN resolution, the six-call fan-out
+- [x] `app/errors.py` — add the upstream codes from the matrix to story 3's existing table
+- [x] `tests/test_linkedin_client.py` — every matrix row against synthetic fixtures, no network
+- [x] `tests/fixtures/` — redacted or synthetic payloads mirroring the real entity shapes; assert no fixture contains a real cookie or a third party's data
+- [x] one live check — the developer's own profile only, asserting all six resources return, kept out of the default test run so CI and graders never hit LinkedIn
 
 **Acceptance Criteria:**
 - Given a valid cookie and a real profile URL, when the client runs, then all six resources return and the raw payloads are available unmodified.
@@ -109,6 +109,10 @@ Date precision falls out of the source exactly as `response-schema.md` requires:
 - Given the repository, when fixtures are inspected, then none contains real personal data or a real cookie.
 
 ## Spec Change Log
+
+- **`NO_SESSION` added to the error table alongside the six upstream codes.** The task said "add the upstream codes from the matrix"; the matrix row for the expired cookie says it must be "distinguished from a missing cookie", and there is no way to distinguish the two without a second code. `app/errors.py` therefore now carries the complete `response-schema.md` table rather than seven of its eight rows. Story 5 wires `NO_SESSION` to the caller-has-stored-nothing path; the client raises it when constructed with a blank cookie.
+- **Section requests carry `&count=100`, which the Code Map's endpoint table does not show.** Verified live on 2026-08-27, and a correctness fix rather than an addition: the default page size is 20, the developer's own profile has 33 skills, and the table's request as written returned 20 of them with a 200 and no error — a truncated list indistinguishable from a complete one. `count=100` returns all 33 in the same single call, so the per-profile call count is unchanged. Where a section still exceeds the page, `SectionFetch.reported_total` and `RawProfile.truncated_sections` make the shortfall visible instead of silent.
+- **`RawProfile.call_count` is per-fetch, not per-client.** Discovered by the live check, which validates the session and then fetches on one client and so read 7 for a six-call fetch. Recorded here because story 5's flow is exactly that shape.
 
 ## Design Notes
 

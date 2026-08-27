@@ -1,9 +1,12 @@
 """The typed error envelope from ``response-schema.md``.
 
-This story implements exactly one code — ``UNAUTHENTICATED`` — but in the shape
-story 8 will adopt for the whole taxonomy. The generalisation story 8 performs
-is adding rows to :data:`ERROR_SPECS`; it should not have to change this
-module's structure, the wire shape, or any call site written against it.
+Story 3 implemented exactly one code — ``UNAUTHENTICATED`` — in the shape the
+whole taxonomy would adopt. Story 4 adds the seven upstream rows, which is
+precisely the generalisation that was predicted: rows in :data:`ERROR_SPECS`,
+and nothing about this module's structure, the wire shape, or any call site
+written against it changed. The table is now complete against
+``response-schema.md``; story 8's remaining work is wiring codes to routes, not
+inventing new ones.
 
 The wire shape is fixed and is not negotiable per code::
 
@@ -62,8 +65,9 @@ class ErrorSpec:
     message: str
 
 
-#: The taxonomy, keyed by code. Story 8 adds the remaining seven rows from
-#: ``response-schema.md``; nothing else about this module needs to change.
+#: The taxonomy, keyed by code. This is ``response-schema.md``'s table,
+#: transcribed — status and ``retryable`` are copied from it, not chosen here,
+#: and a row that disagrees with that file is a bug in this one.
 ERROR_SPECS: dict[str, ErrorSpec] = {
     "UNAUTHENTICATED": ErrorSpec(
         status_code=401,
@@ -74,6 +78,56 @@ ERROR_SPECS: dict[str, ErrorSpec] = {
         # specific reason is logged server-side instead, where the operator can
         # read it and the caller cannot.
         message="Missing or invalid bearer token.",
+    ),
+    # --- Request-shaped failures, decided before any network call -----------
+    "INVALID_URL": ErrorSpec(
+        status_code=400,
+        retryable=False,
+        message="Not a parseable LinkedIn profile URL.",
+    ),
+    # --- LinkedIn session state ---------------------------------------------
+    #
+    # Two codes, one status, and collapsing them would destroy the only thing
+    # the caller can act on: NO_SESSION means "store one", SESSION_EXPIRED
+    # means "the one you stored is dead, store another". A single code would
+    # tell a caller who just supplied a cookie to supply it again.
+    "NO_SESSION": ErrorSpec(
+        status_code=428,
+        retryable=False,
+        message="No LinkedIn session is stored for this caller.",
+    ),
+    "SESSION_EXPIRED": ErrorSpec(
+        status_code=428,
+        retryable=False,
+        message="Stored LinkedIn session is no longer valid.",
+    ),
+    # --- Upstream outcomes ---------------------------------------------------
+    "PROFILE_NOT_FOUND": ErrorSpec(
+        status_code=404,
+        retryable=False,
+        # Deliberately ambiguous between "does not exist" and "not visible to
+        # this session". LinkedIn does not reliably distinguish the two, and
+        # asserting either would be a claim this service cannot support.
+        message="Profile does not exist or is not visible to this session.",
+    ),
+    "RATE_LIMITED": ErrorSpec(
+        status_code=429,
+        # The one retryable 4xx, which is exactly why `ErrorSpec` carries the
+        # flag explicitly instead of deriving it from the status class.
+        retryable=True,
+        message="LinkedIn throttled this request.",
+    ),
+    "UPSTREAM_CHALLENGE": ErrorSpec(
+        status_code=502,
+        retryable=True,
+        message="LinkedIn served a challenge or authwall instead of data.",
+    ),
+    "UPSTREAM_ERROR": ErrorSpec(
+        status_code=502,
+        retryable=True,
+        # Never the upstream's own message. A Voyager error body can echo the
+        # request, and the request carries the session cookie.
+        message="LinkedIn could not be read.",
     ),
 }
 
@@ -143,19 +197,20 @@ def unauthenticated(
 
 # --- Responses this story does not have a taxonomy code for ------------------
 #
-# `ERROR_SPECS` above is the spec table and nothing else — story 8 fills in its
-# remaining seven rows. But a response leaving in FastAPI's default
-# `{"detail": ...}` shape breaks the wire contract just as badly as a wrong
-# code does, and three of them can happen today without any route existing:
-# a 404 for an unknown path, a 405 for a wrong method, and a 500 for a bug.
-# Stories 5-8 add the fourth the moment they declare a query parameter: a
-# 422 from request validation.
+# `ERROR_SPECS` above is the spec table and nothing else. But a response
+# leaving in FastAPI's default `{"detail": ...}` shape breaks the wire contract
+# just as badly as a wrong code does, and three of them can happen without any
+# route existing: a 404 for an unknown path, a 405 for a wrong method, and a
+# 500 for a bug. Stories 5-8 add the fourth the moment they declare a query
+# parameter: a 422 from request validation.
 #
 # So the shape is guaranteed here, separately from the taxonomy. These are
-# NOT taxonomy rows and must not be treated as if they were: story 8 replaces
-# each with a real code from `response-schema.md` (`INVALID_URL` for the
-# validation case, `UPSTREAM_ERROR` for the failure case) and deletes what it
-# supersedes. What it must NOT do is delete the fallback itself.
+# NOT taxonomy rows and must not be treated as if they were: story 8 routes
+# each reachable case to a real code from `response-schema.md` (`INVALID_URL`
+# for the profile-URL validation case, `UPSTREAM_ERROR` for the failure case)
+# and deletes what it supersedes. What it must NOT do is delete the fallback
+# itself — a path with no route at all can still 404, and that 404 still has
+# to wear the envelope.
 FALLBACK_CODES: dict[int, str] = {
     400: "BAD_REQUEST",
     404: "NOT_FOUND",
@@ -166,7 +221,7 @@ FALLBACK_CODE = "INTERNAL_ERROR"
 
 #: What a caller is told when the failure has no code yet. Never the exception
 #: text: on the 500 path that is a stack-trace fragment, and on the 422 path it
-#: is a pydantic dump that can echo a submitted `li_at` cookie straight back
+#: is a pydantic dump that can echo a submitted LinkedIn session cookie back
 #: into the response body.
 FALLBACK_MESSAGES: dict[int, str] = {
     400: "The request could not be understood.",
@@ -234,9 +289,9 @@ async def validation_exception_handler(request: Request, exc: Exception) -> JSON
     """Render request-validation failures as the envelope.
 
     The pydantic error list is deliberately dropped from the body rather than
-    summarised into it. `PUT /api/v1/session` takes a `li_at` cookie in its
-    body (story 5), and a validation error report echoes the offending input —
-    which would put a live LinkedIn session cookie in a response body and in
+    summarised into it. `PUT /api/v1/session` takes a LinkedIn session cookie
+    in its body (story 5), and a validation error report echoes the offending
+    input — which would put a live session cookie in a response body and in
     every log that captures it. The detail is logged at INFO instead.
     """
     if not isinstance(exc, RequestValidationError):  # pragma: no cover

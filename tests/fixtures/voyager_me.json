@@ -1,0 +1,17 @@
+{
+  "data": {
+    "entityUrn": "urn:li:fsd_me:SYNTHETIC",
+    "plainId": 900000001,
+    "*miniProfile": "urn:li:fsd_profile:SYNTHETIC-ada-placeholder",
+    "$type": "com.linkedin.voyager.common.Me"
+  },
+  "included": [
+    {
+      "entityUrn": "urn:li:fsd_profile:SYNTHETIC-ada-placeholder",
+      "publicIdentifier": "ada-placeholder",
+      "firstName": "Ada",
+      "lastName": "Placeholder",
+      "$type": "com.linkedin.voyager.identity.shared.MiniProfile"
+    }
+  ]
+}

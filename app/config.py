@@ -9,13 +9,19 @@ Fields are declared required even when the story that consumes them has not
 been written yet (stories 5-8 own the session vault and the cache). A
 deployment missing ``SESSION_ENCRYPTION_KEY`` must die at boot, not at the
 first ``PUT /api/v1/session``.
+
+There is exactly one exception, added by story 4 and argued for at the field
+itself: a developer-only LinkedIn session used by the opt-in live check. It is
+optional because the real session arrives per-caller at runtime (story 5), so
+requiring it would stop every deployment from booting to serve a variable no
+deployment has.
 """
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Optional
 
-from pydantic import AfterValidator, Field, StringConstraints
+from pydantic import AfterValidator, Field, SecretStr, StringConstraints
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -60,12 +66,46 @@ RequiredSetting = Annotated[
 RequiredBaseUrl = Annotated[RequiredSetting, AfterValidator(_normalise_base_url)]
 
 
+def _blank_secret_is_absent(value: Optional[SecretStr]) -> Optional[SecretStr]:
+    """Treat a present-but-empty optional secret as unset.
+
+    ``.env.example`` must *assign* every variable the codebase reads — the
+    contract test in ``tests/test_health.py`` skips comment lines, so a
+    commented-out line would not document it. That means the shipped example
+    carries ``LINKEDIN_DEV_COOKIE=``, which pydantic-settings reads as the
+    empty string rather than as absent. Without this, every developer who
+    copies the example would hold a "configured" session whose value is ``""``,
+    and the live check would spend a real request proving it is worthless.
+    """
+    if value is None or not value.get_secret_value().strip():
+        return None
+    return value
+
+
+#: An optional secret. ``SecretStr`` is the type, not ``str``, so that the
+#: value cannot reach a log, a traceback, a ``repr`` or a ``model_dump()`` by
+#: accident — all four render it as ``**********``. Reading it requires the
+#: explicit, greppable ``.get_secret_value()``.
+#: ``Optional[SecretStr]`` rather than ``SecretStr | None``: this expression
+#: is evaluated at runtime inside ``Annotated``, where ``from __future__ import
+#: annotations`` does not reach, so the ``|`` form would need Python 3.10+ at
+#: import time even though every annotation in this file is already a string.
+#:
+#: The name matches ``RequiredSetting`` / ``RequiredBaseUrl`` above — and must
+#: not be shortened to ``OptionalSecret``: gitleaks' ``linkedin-client-id`` rule
+#: matches ``linkedin`` followed by a 14-16 character token, so the field
+#: declaration below would read as a leaked credential and the pre-commit hook
+#: would refuse the commit for a type annotation.
+OptionalSecretSetting = Annotated[Optional[SecretStr], AfterValidator(_blank_secret_is_absent)]
+
+
 class Settings(BaseSettings):
     """Environment contract for the LinkedIn Profile API.
 
-    Every field is required and non-blank. An unset, empty or whitespace-only
-    variable fails validation at import time with the offending field named on
-    stderr, so the container exits non-zero and never reports itself healthy.
+    Every field is required and non-blank, except the one explicitly marked
+    optional below. An unset, empty or whitespace-only *required* variable
+    fails validation at import time with the offending field named on stderr,
+    so the container exits non-zero and never reports itself healthy.
     """
 
     model_config = SettingsConfigDict(
@@ -128,7 +168,34 @@ class Settings(BaseSettings):
 
     # --- Application secrets ------------------------------------------------
     session_encryption_key: RequiredSetting = Field(
-        description="Key encrypting stored LinkedIn li_at cookies at rest.",
+        description="Key encrypting stored LinkedIn session cookies at rest.",
+    )
+
+    # --- Developer-only, optional -------------------------------------------
+    #
+    # The ONE optional field in this contract, and the reasoning is not
+    # stylistic:
+    #
+    #   * Required would break every deploy. Production callers supply their
+    #     own LinkedIn session through `PUT /api/v1/session` (story 5); the
+    #     server holds no session of its own, so a required variable would
+    #     force operators to invent a value for something the service does not
+    #     use.
+    #   * Absent entirely would leave the opt-in live check in
+    #     `tests/test_linkedin_live.py` with nowhere to read a session from but
+    #     an ad-hoc environment variable no contract mentions — which is how a
+    #     real cookie ends up pasted into a shell history or a test file.
+    #
+    # It is read in exactly one place (the live check) and never by the
+    # request path. `app/linkedin/client.py` takes the session as an argument
+    # and does not import this module.
+    linkedin_dev_cookie: OptionalSecretSetting = Field(
+        default=None,
+        description=(
+            "Developer's own LinkedIn session cookie, used ONLY by the opt-in "
+            "live check. Optional and unset in every deployment: real sessions "
+            "arrive per-caller at runtime. Never read by the request path."
+        ),
     )
 
 

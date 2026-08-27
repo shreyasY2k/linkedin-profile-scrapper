@@ -1,0 +1,34 @@
+{
+  "data": {
+    "entityUrn": "urn:li:fsd_profileSkillCollection:SYNTHETIC",
+    "paging": {
+      "count": 10,
+      "start": 0,
+      "links": [],
+      "total": 3
+    },
+    "*elements": [
+      "urn:li:fsd_skill:(SYNTHETIC,1)",
+      "urn:li:fsd_skill:(SYNTHETIC,2)",
+      "urn:li:fsd_skill:(SYNTHETIC,3)"
+    ],
+    "$type": "com.linkedin.restli.common.CollectionResponse"
+  },
+  "included": [
+    {
+      "entityUrn": "urn:li:fsd_skill:(SYNTHETIC,1)",
+      "name": "Synthetic Testing",
+      "$type": "com.linkedin.voyager.dash.identity.profile.Skill"
+    },
+    {
+      "entityUrn": "urn:li:fsd_skill:(SYNTHETIC,2)",
+      "name": "Placeholder Design",
+      "$type": "com.linkedin.voyager.dash.identity.profile.Skill"
+    },
+    {
+      "entityUrn": "urn:li:fsd_skill:(SYNTHETIC,3)",
+      "name": "Fixture Review",
+      "$type": "com.linkedin.voyager.dash.identity.profile.Skill"
+    }
+  ]
+}

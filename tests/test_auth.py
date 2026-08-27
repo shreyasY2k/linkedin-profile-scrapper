@@ -978,15 +978,20 @@ def test_an_unhandled_exception_is_a_typed_500_not_a_naked_one(
 
 
 def test_the_fallback_codes_are_not_mistaken_for_taxonomy_rows() -> None:
-    """Story 8 owns `response-schema.md`'s eight codes; these are not among them.
+    """`response-schema.md`'s codes are the taxonomy; these are not among them.
 
     Keeping the two sets disjoint is what stops the fallback from quietly
-    becoming the taxonomy — and from story 8 "already having" a code it has not
-    actually specified.
+    becoming the taxonomy — from a 422 shaped like `INVALID_URL` being counted
+    as the real `INVALID_URL`, which story 8 must actually route.
+
+    Story 4 filled `ERROR_SPECS` out to the full schema table, so the row count
+    is no longer pinned here; `tests/test_linkedin_client.py` asserts the table
+    against a hand-transcribed copy of the spec instead. What is pinned here is
+    that the fallback set stayed *outside* it.
     """
     from app.errors import ERROR_SPECS, FALLBACK_CODE, FALLBACK_CODES
 
-    assert set(ERROR_SPECS) == {"UNAUTHENTICATED"}
+    assert "UNAUTHENTICATED" in ERROR_SPECS
     assert not set(FALLBACK_CODES.values()) & set(ERROR_SPECS)
     assert FALLBACK_CODE not in ERROR_SPECS
 

@@ -1,0 +1,14 @@
+{
+  "data": {
+    "entityUrn": "urn:li:fsd_profileLanguageCollection:SYNTHETIC",
+    "paging": {
+      "count": 10,
+      "start": 0,
+      "links": [],
+      "total": 0
+    },
+    "*elements": [],
+    "$type": "com.linkedin.restli.common.CollectionResponse"
+  },
+  "included": []
+}

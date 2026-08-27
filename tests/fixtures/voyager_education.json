@@ -1,0 +1,38 @@
+{
+  "data": {
+    "entityUrn": "urn:li:fsd_profileEducationCollection:SYNTHETIC",
+    "paging": {
+      "count": 10,
+      "start": 0,
+      "links": [],
+      "total": 1
+    },
+    "*elements": [
+      "urn:li:fsd_profileEducation:(SYNTHETIC,1)"
+    ],
+    "$type": "com.linkedin.restli.common.CollectionResponse"
+  },
+  "included": [
+    {
+      "entityUrn": "urn:li:fsd_profileEducation:(SYNTHETIC,1)",
+      "schoolName": "Placeholder Institute of Technology",
+      "schoolUrn": "urn:li:fsd_school:900003",
+      "companyUrn": "urn:li:fsd_company:900003",
+      "degreeName": "Bachelor of Synthetic Data",
+      "fieldOfStudy": "Fixture Engineering",
+      "grade": "First Class",
+      "dateRange": {
+        "start": {
+          "year": 2016,
+          "$type": "com.linkedin.common.Date"
+        },
+        "end": {
+          "year": 2020,
+          "$type": "com.linkedin.common.Date"
+        },
+        "$type": "com.linkedin.common.DateRange"
+      },
+      "$type": "com.linkedin.voyager.dash.identity.profile.Education"
+    }
+  ]
+}

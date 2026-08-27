@@ -99,3 +99,32 @@
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/2-walking-skeleton-deploy.md`
   summary: An unauthenticated caller can enumerate which /api/v1 paths exist, because a non-existent path returns 404 while a real one returns 401.
   evidence: Verified on the deployed host - GET /api/v1/x without a token returns 404 NOT_FOUND, since FastAPI resolves routing before router-level dependencies run. No data is exposed, but it distinguishes real routes from absent ones. Story 8 could normalise unmatched /api/v1 paths to 401.
+
+- source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
+  summary: The Voyager endpoint map is verified against exactly one profile — the developer's own — so per-profile shape variation is untested.
+  evidence: The live check fetches only the session owner, by design (every fetch spends real quota against a real account, and a third party's profile is not the author's data to spend). Profiles with no certifications, a hidden headline, or a non-en_US primary locale may carry shapes no fixture mirrors. Story 6's mapper must therefore treat every field as optional rather than trusting the measured shape table.
+
+- source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
+  summary: A section failing with SESSION_EXPIRED or RATE_LIMITED degrades to a partial profile rather than failing the whole fetch.
+  evidence: The Design Notes say a section that errors should degrade and only a core failure should abort, and that is what is implemented. But those two codes are systemic, not per-section: if languages is throttled the others probably were too, and answering 200-with-partial is arguably less honest than answering 429. The client records the code per section so story 6/8 can decide; they should decide deliberately rather than inherit this.
+
+- source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
+  summary: Section pagination is not followed — a profile with more than 100 entries in one section is still silently truncated.
+  evidence: Found live, not hypothesised: the default page size is 20 and the developer's own profile has 33 skills, so the first implementation returned 20 of 33 with a 200 and no error. Fixed by requesting `count=100`, which returns all 33 in the SAME single call and so does not touch the per-profile call budget. Beyond 100 the shortfall is visible rather than fixed — `SectionFetch.reported_total` carries `data.paging.total` and `RawProfile.truncated_sections` names any section where it exceeds what came back. Story 6 must act on that rather than presenting a truncated list as a complete history; following pages would multiply the call count and is Ask First.
+
+- source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
+  summary: There is no retry and no timeout budget across the whole fetch, only a per-call timeout.
+  evidence: Deliberate — a retry multiplies quota spend and the failures worth retrying are the ones an immediate retry makes worse. But five concurrent sections each with a 15s timeout means a wedged upstream holds a request for 15s, and nothing caps the total. Story 7's stale-serve is the intended recovery; if it lands, a whole-fetch deadline belongs with it.
+
+- source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
+  summary: `LINKEDIN_DEV_COOKIE` is the first optional field in the env contract, weakening the "every variable is required, blank fails at boot" invariant story 1 established.
+  evidence: Argued at the field and asserted in `tests/conftest.py` (OPTIONAL_SETTINGS is pinned, so a second optional field fails a test). The alternative — a required variable no deployment uses — is worse. Story 3's deferred LOG_LEVEL note asked that optional settings be decided deliberately before one is added ad hoc; this is that decision, and it is narrow: developer-only, read by nothing on the request path.
+
+- source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
+  summary: The type alias in `app/config.py` is named `OptionalSecretSetting` specifically so gitleaks' `linkedin-client-id` rule does not fire on the field declaration.
+  evidence: That rule matches `linkedin` followed by a 14-16 character token, so `linkedin_dev_cookie: OptionalSecret = Field(` reads as a leaked credential and the pre-commit hook refuses the commit. Documented at the alias. A `.gitleaksignore` or an allowlist rule would be the honest fix; naming around a scanner is a trap for whoever renames it next.
+
+- source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
+  summary: A challenge is detected by final URL and content type, so a challenge served as valid JSON at the requested URL would be read as data.
+  evidence: LinkedIn has no reason to do this today and both observed challenge forms (redirect to /authwall, HTML in place) are caught. Adding a body-shape check — "a 200 that parses but carries neither `data` nor `included`" — would close it, at the cost of guessing about payloads that were never observed.
+

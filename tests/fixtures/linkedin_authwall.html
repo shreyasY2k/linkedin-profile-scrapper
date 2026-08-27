@@ -1,0 +1,27 @@
+<!--
+  Synthetic stand-in for the page LinkedIn serves instead of JSON when it wants
+  a human. Written by hand, not captured: a real authwall carries tracking ids
+  and a redirect target built from the request that drew it.
+
+  The point of this file is the SHAPE, and the shape is the whole lesson: a
+  challenge arrives with `Content-Type: text/html` at the end of a redirect
+  chain, and the status on the page it lands on is 200. Classifying on status
+  alone reads this as a successful fetch and then fails to parse it as JSON —
+  which is why app/linkedin/client.py detects a challenge by destination and
+  content type, not by status.
+-->
+<!doctype html>
+<html lang="en">
+  <head>
+    <title>Sign in | LinkedIn</title>
+  </head>
+  <body>
+    <main class="authwall">
+      <h1>Join LinkedIn to see this profile</h1>
+      <p>Sign in to continue.</p>
+      <form action="/uas/login-submit" method="post">
+        <button type="submit">Sign in</button>
+      </form>
+    </main>
+  </body>
+</html>

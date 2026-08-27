@@ -1,0 +1,30 @@
+{
+  "data": {
+    "entityUrn": "urn:li:fsd_profileLanguageCollection:SYNTHETIC",
+    "paging": {
+      "count": 10,
+      "start": 0,
+      "links": [],
+      "total": 2
+    },
+    "*elements": [
+      "urn:li:fsd_profileLanguage:(SYNTHETIC,1)",
+      "urn:li:fsd_profileLanguage:(SYNTHETIC,2)"
+    ],
+    "$type": "com.linkedin.restli.common.CollectionResponse"
+  },
+  "included": [
+    {
+      "entityUrn": "urn:li:fsd_profileLanguage:(SYNTHETIC,1)",
+      "name": "Testish",
+      "proficiency": "NATIVE_OR_BILINGUAL",
+      "$type": "com.linkedin.voyager.dash.identity.profile.Language"
+    },
+    {
+      "entityUrn": "urn:li:fsd_profileLanguage:(SYNTHETIC,2)",
+      "name": "Placeholderese",
+      "proficiency": "PROFESSIONAL_WORKING",
+      "$type": "com.linkedin.voyager.dash.identity.profile.Language"
+    }
+  ]
+}

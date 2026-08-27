@@ -1,0 +1,35 @@
+{
+  "data": {
+    "entityUrn": "urn:li:fsd_profileCertificationCollection:SYNTHETIC",
+    "paging": {
+      "count": 10,
+      "start": 0,
+      "links": [],
+      "total": 1
+    },
+    "*elements": [
+      "urn:li:fsd_profileCertification:(SYNTHETIC,1)"
+    ],
+    "$type": "com.linkedin.restli.common.CollectionResponse"
+  },
+  "included": [
+    {
+      "entityUrn": "urn:li:fsd_profileCertification:(SYNTHETIC,1)",
+      "name": "Certified Synthetic Fixture Author",
+      "authority": "Example Standards Body",
+      "companyUrn": "urn:li:fsd_company:900004",
+      "url": "https://certs.example.invalid/synthetic/1",
+      "licenseNumber": "SYNTHETIC-0001",
+      "displaySource": "certs.example.invalid",
+      "dateRange": {
+        "start": {
+          "month": 11,
+          "year": 2022,
+          "$type": "com.linkedin.common.Date"
+        },
+        "$type": "com.linkedin.common.DateRange"
+      },
+      "$type": "com.linkedin.voyager.dash.identity.profile.Certification"
+    }
+  ]
+}
