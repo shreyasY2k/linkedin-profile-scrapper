@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from app.db import CacheRow
 from app.linkedin.client import (
     SECTION_RESOURCES,
     RawProfile,
@@ -39,7 +40,12 @@ from app.linkedin.client import (
 
 # Re-exports. See the module docstring for why these are not moved.
 from tests.test_auth import RecordingFetcher, bearer, make_token  # noqa: F401
-from tests.test_vault import COOKIE, OTHER_COOKIE, InMemoryStore  # noqa: F401
+from tests.test_vault import (  # noqa: F401
+    COOKIE,
+    OTHER_COOKIE,
+    InMemoryStore,
+    RecordingConnection,
+)
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -60,6 +66,65 @@ SUBJECT_B = "9f2c1d84-0a77-4a15-bd0e-1c7a3f5b2e40"
 
 def load(name: str) -> dict[str, Any]:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+class InMemoryProfileCacheStore:
+    """An :class:`app.db.ProfileCacheStore` that keeps rows in a dict.
+
+    Structural rather than a Mock, for the same reason ``InMemoryStore`` is:
+    what these tests are about is the exact document the cache hands its store
+    and hands back, so the double records exactly that and nothing else. It
+    keeps ``body`` as the **string** it was given, which is what makes "a record
+    is served exactly as it was stored" a byte-for-byte assertion rather than a
+    dict comparison that would survive a re-serialisation.
+
+    ``fail_writes`` / ``fail_reads`` turn either direction into a raise, which
+    is how the matrix's "the datastore rejects the write" row is exercised
+    without a database. ``answer_with`` forces ``load`` to return a row the
+    lookup was not asked for, which is the dropped-``WHERE`` mutation the real
+    SQL tests can only describe.
+    """
+
+    def __init__(self) -> None:
+        self.rows: dict[str, CacheRow] = {}
+        #: Every document ever written, replacements included.
+        self.written: list[tuple[str, str, int, datetime]] = []
+        self.loads: list[str] = []
+        self.fail_writes = False
+        self.fail_reads = False
+        #: When set, every `load` returns THIS row whatever it was asked for —
+        #: exactly what a `SELECT` with no `WHERE` clause does.
+        self.answer_with: CacheRow | None = None
+
+    def save(
+        self, public_id: str, body: str, envelope_version: int, fetched_at: datetime
+    ) -> CacheRow | None:
+        assert isinstance(body, str), "the cache must hand the store a serialised body"
+        assert fetched_at.tzinfo is not None, "the cache must hand the store UTC"
+        if self.fail_writes:
+            raise RuntimeError("the datastore rejected the write")
+        standing = self.rows.get(public_id)
+        if standing is not None and standing.fetched_at > fetched_at:
+            # Mirrors `WHERE profile_cache.fetched_at <= EXCLUDED.fetched_at`:
+            # the record never moves backwards in time, and a refused update
+            # returns no row.
+            return None
+        self.written.append((public_id, body, envelope_version, fetched_at))
+        self.rows[public_id] = CacheRow(
+            public_id=public_id,
+            body=body,
+            envelope_version=envelope_version,
+            fetched_at=fetched_at,
+        )
+        return self.rows[public_id]
+
+    def load(self, public_id: str) -> CacheRow | None:
+        self.loads.append(public_id)
+        if self.fail_reads:
+            raise RuntimeError("the datastore could not be reached")
+        if self.answer_with is not None:
+            return self.answer_with
+        return self.rows.get(public_id)
 
 
 #: The complete profile: every section populated.

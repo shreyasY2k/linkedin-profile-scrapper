@@ -1,10 +1,15 @@
 """Postgres access, and the schema this application owns.
 
 Two things live here and nothing else: how a connection is opened, and the
-SQL the session vault runs. The vault above it (:mod:`app.vault`) knows about
+SQL the layers above it run. The vault above it (:mod:`app.vault`) knows about
 ciphertext and never about Postgres; this module knows about Postgres and never
 about plaintext. That split is what makes "the cookie is in plaintext in
 exactly one module" a checkable claim rather than a habit.
+
+Story 7's response cache (:mod:`app.cache`) is filed the same way and for the
+same reason: this module stores an opaque text document against a public id and
+has no idea it is a JSON response envelope. Nothing here can reshape a cached
+body, because nothing here knows what one looks like.
 
 ===============================================================================
 NO MIGRATION TOOL, BY DECISION (2026-08-27)
@@ -58,16 +63,28 @@ SCHEMA = "app"
 #: no history table and no soft-delete column — story 5 has no delete path.
 SESSION_TABLE = "linkedin_session"
 
+#: One row per LinkedIn public id: the last good response for that profile.
+#:
+#: Keyed by profile, **not** by caller, and that is a decision rather than an
+#: oversight. This table holds public profile data, so a record fetched under
+#: one session answers any caller — which is safe only because the session
+#: checks in :mod:`app.api.v1.profile` happen *before* the cache is consulted.
+#: A caller with no session, or a dead one, is refused before this table is
+#: read, so it cannot be harvested by somebody with no working credential of
+#: their own. Nothing about a session or a subject is ever written here.
+CACHE_TABLE = "profile_cache"
+
 #: Identifiers are interpolated into DDL below, which parameter binding cannot
 #: do. They are module constants rather than anything caller-supplied, and this
 #: pattern is what keeps them that way if someone later makes one configurable.
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]*$")
-for _identifier in (SCHEMA, SESSION_TABLE):
+for _identifier in (SCHEMA, SESSION_TABLE, CACHE_TABLE):
     if not _IDENTIFIER_RE.match(_identifier):
         raise ValueError(f"{_identifier!r} is not a safe SQL identifier")
 
 #: ``schema.table``, written once so no statement can name a different one.
 SESSION_RELATION = f"{SCHEMA}.{SESSION_TABLE}"
+CACHE_RELATION = f"{SCHEMA}.{CACHE_TABLE}"
 
 
 # --- The schema --------------------------------------------------------------
@@ -88,6 +105,45 @@ SESSION_RELATION = f"{SCHEMA}.{SESSION_TABLE}"
 #: * ``last_used_at`` / ``last_use_ok`` are nullable and start NULL, meaning
 #:   "stored, never used yet". Distinct from "used and it failed", which is what
 #:   ``GET /api/v1/session`` has to be able to say.
+#: * ``public_id`` is the PRIMARY KEY of the cache table, which is what makes
+#:   "one record per profile, replaced by every successful fetch" a property of
+#:   the schema. It is already lower-cased by ``parse_profile_url``, so there is
+#:   no second normalisation here to drift away from that one.
+#: * ``body`` is ``text`` holding the serialised response envelope, NOT
+#:   ``jsonb``. Two reasons, and both are about the story's central promise that
+#:   a record is served exactly as it was stored. ``jsonb`` reorders keys and
+#:   collapses duplicates, so a stale response would come back reshaped; and
+#:   ``jsonb`` cannot hold a ``\\u0000`` escape at all, so one NUL anywhere in a
+#:   member's "about" text would turn every cache write for that profile into a
+#:   logged failure. ``text`` round-trips byte for byte. An operator who wants
+#:   to query into it can still ``select body::jsonb -> 'profile'``.
+#: * ``fetched_at`` is when LinkedIn was actually read — never when the row was
+#:   written. It is the caller's only staleness signal, so it is stored as its
+#:   own ``timestamptz`` column rather than only inside ``body``: that is what
+#:   makes the psql check in the story's Verification block possible. There is
+#:   deliberately no second "written at" timestamp; a column nothing reads is an
+#:   invitation to serve the wrong one.
+#:
+#: * ``envelope_version`` records which response shape the stored document was
+#:   written in. Because records never expire, a body written before an envelope
+#:   change would otherwise be republished verbatim for ever — a reviewer seeded
+#:   one with no ``partial`` key and got a 200 without it, while
+#:   ``response-schema.md`` says that key is always present precisely so that
+#:   "empty" and "predates the field" stay distinguishable. A row whose version
+#:   is not the current one is treated as **absent**, never deleted: unbounded is
+#:   the decision, and ignoring a row is not evicting it. See
+#:   :data:`app.cache.ENVELOPE_VERSION`.
+#:
+#: There is no TTL column, no expiry index and no eviction, by decision — see
+#: :mod:`app.cache`. Do not add one.
+#:
+#: **Adding a column later is not free.** These are ``CREATE TABLE IF NOT
+#: EXISTS``, so a table that already exists is left exactly as it is: a new
+#: column in this DDL would simply never appear on a warm volume, and every
+#: statement naming it would fail — silently, on the cache path. Until story 10
+#: brings a migration tool, a column added here must also be added by an
+#: ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` statement in this tuple. Nothing
+#: needed one yet because both tables are still new.
 BOOTSTRAP_STATEMENTS: tuple[str, ...] = (
     f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}",
     f"""
@@ -97,6 +153,14 @@ BOOTSTRAP_STATEMENTS: tuple[str, ...] = (
         stored_at    timestamptz NOT NULL,
         last_used_at timestamptz,
         last_use_ok  boolean
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {CACHE_RELATION} (
+        public_id        text        PRIMARY KEY,
+        body             text        NOT NULL,
+        envelope_version integer     NOT NULL,
+        fetched_at       timestamptz NOT NULL
     )
     """,
 )
@@ -155,6 +219,57 @@ def connect() -> psycopg.Connection:
         settings.database_url.get_secret_value(),
         connect_timeout=CONNECT_TIMEOUT_SECONDS,
         application_name=APPLICATION_NAME,
+    )
+
+
+#: Server-side ceiling on any single cache statement, in milliseconds.
+#:
+#: The cache is the one caller in this codebase whose failures are **swallowed**
+#: on purpose, which is exactly why it is the one that must not be able to hang.
+#: Everywhere else a wedged statement surfaces to the caller as a typed 503; on
+#: the cache path it would instead hold the request open — after the upstream
+#: failure has already been decided, or after a correct 200 body has already
+#: been built — and occupy a thread from the default executor that
+#: ``vault.unlock`` shares, so one stuck Postgres backend starves requests that
+#: have nothing to do with the cache.
+#:
+#: ``asyncio.timeout`` around the ``to_thread`` call frees the *request*, but it
+#: cannot cancel work already running in a thread. This is the half that frees
+#: the *thread*: Postgres aborts the statement itself, the driver returns, and
+#: the worker goes back to the pool. Both halves are needed, and neither is
+#: sufficient alone.
+#:
+#: Generous relative to the work — every cache statement is a single-row lookup
+#: or upsert on a primary key — so it can only fire on a database that has
+#: stopped answering, never on one that is merely busy.
+CACHE_STATEMENT_TIMEOUT_MS = 5_000
+
+#: The cache's connect timeout, deliberately shorter than the session store's.
+#: A caller waiting on the session vault has no answer without it; a caller
+#: waiting on the cache either already has their profile or already has their
+#: error, so a slow connection there is pure added latency on a request whose
+#: outcome is settled.
+CACHE_CONNECT_TIMEOUT_SECONDS = 5
+
+
+def connect_for_cache() -> psycopg.Connection:
+    """Open one connection for the response cache, with both timeouts set.
+
+    Separate from :func:`connect` rather than changing it, because the two have
+    genuinely different failure contracts. A statement timeout on the session
+    store would also apply to :func:`bootstrap`, whose DDL waits on an advisory
+    lock that a second starting container may legitimately hold — turning a
+    normal startup race into a boot failure. The cache runs no DDL and no lock,
+    so it can carry a ceiling the rest of the module must not.
+    """
+    return psycopg.connect(
+        settings.database_url.get_secret_value(),
+        connect_timeout=CACHE_CONNECT_TIMEOUT_SECONDS,
+        application_name=APPLICATION_NAME,
+        # libpq passes this through to the backend as a session GUC, so the
+        # ceiling is enforced by Postgres rather than by anything here choosing
+        # to give up. `-c` options are server settings, not shell arguments.
+        options=f"-c statement_timeout={CACHE_STATEMENT_TIMEOUT_MS}",
     )
 
 
@@ -348,21 +463,30 @@ class PostgresSessionStore:
             row = cursor.fetchone()
         return _to_row(row) if row is not None else None
 
-    @contextmanager
-    def _guarded(self) -> Iterator[Any]:
+    def _guarded(self) -> Any:
         """One connection, one cursor, and psycopg errors renamed on the way out."""
-        try:
-            with self._connect() as connection:
-                with connection.cursor() as cursor:
-                    yield cursor
-        except psycopg.Error as exc:
-            # The message is logged, never returned: a psycopg error can quote
-            # the statement, and the statement for an upsert carries the
-            # ciphertext parameter.
-            logger.error(
-                "Datastore operation failed: %s: %s", type(exc).__name__, exc
-            )
-            raise DatastoreUnavailable(type(exc).__name__) from exc
+        return _guarded_cursor(self._connect)
+
+
+@contextmanager
+def _guarded_cursor(connect_fn: Callable[[], Any]) -> Iterator[Any]:
+    """One connection, one cursor, and psycopg errors renamed on the way out.
+
+    Shared by both stores in this module rather than written twice. The two
+    tables have nothing in common, but the failure contract does: every
+    ``psycopg.Error`` becomes :class:`DatastoreUnavailable`, so the driver never
+    leaks upward and a database fault is a typed 503 rather than a naked 500.
+    """
+    try:
+        with connect_fn() as connection:
+            with connection.cursor() as cursor:
+                yield cursor
+    except psycopg.Error as exc:
+        # The message is logged, never returned: a psycopg error can quote the
+        # statement, and the statement for a session upsert carries the
+        # ciphertext parameter.
+        logger.error("Datastore operation failed: %s: %s", type(exc).__name__, exc)
+        raise DatastoreUnavailable(type(exc).__name__) from exc
 
 
 def _to_row(row: tuple) -> SessionRow:
@@ -375,4 +499,142 @@ def _to_row(row: tuple) -> SessionRow:
         stored_at=stored_at,
         last_used_at=last_used_at,
         last_use_ok=last_use_ok,
+    )
+
+
+# --- The response cache store (story 7) --------------------------------------
+
+
+@dataclass(frozen=True)
+class CacheRow:
+    """One cached profile, exactly as the table holds it.
+
+    ``body`` is an opaque string here on purpose. This module stores and returns
+    the characters it was given and never parses them; :mod:`app.cache` is the
+    only thing that knows they are a JSON response envelope. That is what makes
+    "a record is served exactly as it was stored" checkable at this layer: there
+    is no code path in this module that could reshape one.
+
+    Nothing on this object is a secret — it is public profile data plus the time
+    it was read — so an ordinary ``repr`` is safe.
+    """
+
+    public_id: str
+    body: str
+    envelope_version: int
+    fetched_at: datetime
+
+
+class ProfileCacheStore(Protocol):
+    """What :class:`app.cache.ProfileCache` needs from a datastore.
+
+    A Protocol for the same reason :class:`SessionStore` is one: the whole
+    stale-serve matrix has to be provable with no Postgres and no network, since
+    ``docker run --network none`` is a verification command for this story.
+
+    Note what is *not* here: no delete, no expiry, no sweep. Stale-serve is
+    unbounded by decision, and an interface with no way to remove a record is
+    how that decision survives someone later "tidying up" — see
+    :mod:`app.cache`. The implementation must not grow one either; a Protocol
+    that omits a method proves nothing about the class behind it, which is why
+    ``tests/test_cache.py`` asserts against :class:`PostgresProfileCacheStore`.
+    """
+
+    def save(
+        self, public_id: str, body: str, envelope_version: int, fetched_at: datetime
+    ) -> CacheRow | None: ...
+
+    def load(self, public_id: str) -> CacheRow | None: ...
+
+
+_CACHE_COLUMNS = "public_id, body, envelope_version, fetched_at"
+
+#: Every successful live retrieval replaces the record — unless a **newer** one
+#: already stands.
+#:
+#: The ``WHERE`` on the ``DO UPDATE`` is the whole of that qualifier and it is
+#: not hypothetical: two concurrent requests for the same profile finish in
+#: whatever order LinkedIn answers them, not in the order they started, so a
+#: plain ``DO UPDATE`` lets the slower fetch's older body overwrite the faster
+#: fetch's newer one. The record is defined as *the last good one*, and moving
+#: it backwards in time would publish a ``fetched_at`` that goes down.
+#:
+#: ``<=`` rather than ``<`` so that re-storing an identical fetch is still a
+#: write; only a strictly older one is refused, and a refusal returns no row.
+#: There is no history and no second version: the contract offers exactly one
+#: alternative to a live answer, so keeping older bodies would be storing
+#: something nothing can ever return.
+_CACHE_SAVE_SQL = f"""
+INSERT INTO {CACHE_RELATION} (public_id, body, envelope_version, fetched_at)
+VALUES (%s, %s, %s, %s)
+ON CONFLICT (public_id) DO UPDATE
+   SET body             = EXCLUDED.body,
+       envelope_version = EXCLUDED.envelope_version,
+       fetched_at       = EXCLUDED.fetched_at
+ WHERE {CACHE_TABLE}.fetched_at <= EXCLUDED.fetched_at
+RETURNING {_CACHE_COLUMNS}
+"""
+
+#: Keyed on the public id alone, with no age predicate anywhere in it. A record
+#: of any age is served in preference to a retryable error, so a ``WHERE
+#: fetched_at > ...`` here would silently reintroduce the TTL the spec rules
+#: out.
+_CACHE_LOAD_SQL = f"SELECT {_CACHE_COLUMNS} FROM {CACHE_RELATION} WHERE public_id = %s"
+
+#: Every statement this module runs against the cache table. Enumerated so that
+#: ``tests/test_cache.py`` can check *all* of them — for an age bound, for the
+#: relation they name, and for columns that exist — rather than whichever one a
+#: test author happened to think of. A new statement that is not added here is
+#: a statement nothing checks.
+CACHE_STATEMENTS: tuple[str, ...] = (_CACHE_SAVE_SQL, _CACHE_LOAD_SQL)
+
+
+class PostgresProfileCacheStore:
+    """:class:`ProfileCacheStore` backed by the table :func:`bootstrap` creates.
+
+    ``connect_fn`` is injectable for exactly the reason it is on
+    :class:`PostgresSessionStore`: a test that asserts a substring of
+    ``_CACHE_LOAD_SQL`` passes just as happily when the executed statement drops
+    its ``WHERE`` clause — which here means answering one member's request with
+    whichever profile Postgres hands back first. The seam lets the offline suite
+    record every ``(sql, params)`` pair this class hands the driver.
+
+    It defaults to :func:`connect_for_cache`, not :func:`connect`: see that
+    function for why the cache is the one path in this module that carries a
+    statement timeout.
+    """
+
+    def __init__(self, connect_fn: Callable[[], Any] = connect_for_cache) -> None:
+        self._connect = connect_fn
+
+    def save(
+        self, public_id: str, body: str, envelope_version: int, fetched_at: datetime
+    ) -> CacheRow | None:
+        """Store the record, or return ``None`` if a newer one already stands.
+
+        ``None`` is a success, not a failure: it means a concurrent request for
+        the same profile got a fresher answer in first, and the row was left
+        holding that one. See :data:`_CACHE_SAVE_SQL`.
+        """
+        with _guarded_cursor(self._connect) as cursor:
+            cursor.execute(
+                _CACHE_SAVE_SQL, (public_id, body, envelope_version, fetched_at)
+            )
+            row = cursor.fetchone()
+        return _to_cache_row(row) if row is not None else None
+
+    def load(self, public_id: str) -> CacheRow | None:
+        with _guarded_cursor(self._connect) as cursor:
+            cursor.execute(_CACHE_LOAD_SQL, (public_id,))
+            row = cursor.fetchone()
+        return _to_cache_row(row) if row is not None else None
+
+
+def _to_cache_row(row: tuple) -> CacheRow:
+    public_id, body, envelope_version, fetched_at = row
+    return CacheRow(
+        public_id=public_id,
+        body=body,
+        envelope_version=envelope_version,
+        fetched_at=fetched_at,
     )

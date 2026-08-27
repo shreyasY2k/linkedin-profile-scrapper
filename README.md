@@ -7,7 +7,8 @@ retrieved under the caller's own LinkedIn session.
 > added **Get a token** to it, including the first of the two copy-paste `curl`
 > commands CAP-3 is graded on; story 5 added **Store your LinkedIn session**,
 > which the second `curl` depends on; story 6 added **Fetch a profile**, which
-> is that second `curl`. Story 9 owns the remaining three required sections —
+> is that second `curl`; story 7 added **When LinkedIn will not answer**, which
+> is what `stale` means. Story 9 owns the remaining three required sections —
 > **API documentation**, **Approach**, and **Known limitations**. Placeholders
 > below mark where they go. Do not delete the placeholders; fill them.
 
@@ -357,6 +358,12 @@ Errors wear the same typed envelope as everything else:
 | `503 SERVICE_UNAVAILABLE` | this service could not reach its own datastore |
 | `500 INTERNAL_ERROR` | a bug here. It still wears the envelope above; nothing ever returns a naked 500 or a stack trace |
 
+The three with `"retryable": true` — `RATE_LIMITED`, `UPSTREAM_CHALLENGE`,
+`UPSTREAM_ERROR` — are the ones you may never actually see, because a cached
+record outranks them. The reverse also holds and matters more: a `428
+SESSION_EXPIRED` is never softened into a stale `200`, with one honest
+exception. See **When LinkedIn will not answer** below for both.
+
 Every one of these is `Cache-Control: no-store`, including the successful
 response: these bodies are specific to *you*, and a shared cache in front of the
 service keys on nothing that distinguishes one caller from another.
@@ -370,6 +377,136 @@ without a `region`. A brittle nicety must not take down the fetch.)
 
 Each call has a 15s timeout and the whole fetch has a 45s backstop, so a wedged
 upstream cannot hold a request open indefinitely.
+
+### When LinkedIn will not answer
+
+Every request depends on LinkedIn answering *right now*, across six calls, under
+a cookie that may have died since you stored it. So every successful answer is
+kept, and when a live retrieval fails for a reason **retrying could fix**, you
+get the last good record for that profile instead of the error:
+
+```json
+{
+  "url": "https://www.linkedin.com/in/example",
+  "public_id": "example",
+  "stale": true,
+  "fetched_at": "2026-08-27T09:00:00Z",
+  "partial": ["experience.employment_type"],
+  "profile": {
+    "name": {"first": "…", "last": "…", "full": "…"},
+    "headline": "…",
+    "location": {"country": "IN", "region": "Bengaluru, Karnataka"},
+    "about": "…",
+    "experience": [ ... ], "education": [ ... ], "skills": [ ... ],
+    "certifications": [ ... ], "languages": [ ... ],
+    "images": {"profile": "https://…", "background": "https://…"}
+  }
+}
+```
+
+That is the **full** payload, not a summary of one: a stale answer is
+byte-for-byte the response that was returned when the profile was last fetched,
+with `stale` flipped. (`profile` is elided above only for length — the shape is
+the one documented under **Fetch a profile**.)
+
+Two fields carry the whole of it, and they are meant to be read together:
+
+- **`stale`** — `false` when `profile` was retrieved from LinkedIn during *this*
+  request; `true` when the live call failed and a stored record was served in
+  its place. There is no third value and no other signal: a 200 is either fresh
+  or explicitly flagged.
+- **`fetched_at`** — when the returned profile was actually read from LinkedIn,
+  **never** when the request was served. On a stale answer it is the older
+  timestamp. That is what makes staleness actionable rather than cosmetic, and
+  it is the reason nothing in this service ever re-stamps it.
+
+The record served is the record that was stored, unchanged — the same `profile`,
+the same `partial[]`, the same omitted keys. Nothing is re-derived on the way
+out, so a stale answer is an answer that was once true, republished with an
+honest label on it.
+
+**Staleness is unbounded, by decision.** There is no TTL, no eviction and no age
+limit, so a record from any point in the past is served in preference to a
+`502`. That is a trade made deliberately: an answer you can date and judge is
+more useful than an error page, and `fetched_at` gives you everything you need
+to decide whether to trust it. If you want only fresh data, refuse any response
+whose `stale` is `true` — the flag exists so that is a one-line check.
+
+**What is never masked this way.** Only the three `retryable: true` codes fall
+back to a record. A failure this API classifies as permanent reaches you as
+itself, however good the cached copy is. Every answer the endpoint can give you
+with a record in the cache:
+
+| Situation | Cached record exists | You get |
+|---|---|---|
+| LinkedIn throttled us (`RATE_LIMITED`) | yes | `200`, `"stale": true` |
+| Challenge or authwall (`UPSTREAM_CHALLENGE`) | yes | `200`, `"stale": true` |
+| Any other upstream failure (`UPSTREAM_ERROR`) | yes | `200`, `"stale": true` |
+| Any of the three | no | the typed error, unchanged |
+| Any of the three, but the cache itself could not be read | — | the typed error, unchanged |
+| Any of the three, but the record is unreadable or was written under an older response shape | — | the typed error, unchanged |
+| Your session died (`SESSION_EXPIRED`) | yes | `428` — never a stale 200. **See the gap below.** |
+| You stored no session (`NO_SESSION`) | yes | `428`, and the record is not even looked up |
+| No or invalid bearer token (`UNAUTHENTICATED`) | yes | `401`, before this endpoint runs at all |
+| Profile gone or hidden (`PROFILE_NOT_FOUND`) | yes | `404` — a deleted profile is not stale data |
+| Malformed URL (`INVALID_URL`) | yes | `400` |
+| LinkedIn answered about a **different member** | yes | `502` — see below |
+
+The last row is a deliberate choice rather than a consequence. If a fetch comes
+back naming somebody other than the member you asked for — a vanity URL that has
+changed hands, a redirect, an upstream substitution — you get a `502` and *not*
+the cached record, even though the code it carries is technically retryable.
+That condition is permanent, and under a cache with no expiry a stale `200`
+would republish the old identity mapping for ever without ever telling you the
+URL has stopped meaning what you think.
+
+Hiding a dead cookie behind cached data would report success forever about a
+credential that stopped working, which is the one failure this design exists to
+avoid.
+
+> **The one gap in that promise, and it is real.** LinkedIn does not always
+> *state* a refusal as a refusal. A dead `li_at` is sometimes answered with a
+> redirect to an authwall carrying a `200`, which is the same page a datacenter
+> IP draws with a perfectly good session — this service genuinely cannot tell
+> them apart, so it classifies both as `UPSTREAM_CHALLENGE`, which is retryable,
+> which means that particular kind of dead session **is** stale-served. This was
+> verified against the running stack, not theorised. If `stale` has been `true`
+> for longer than you can explain, re-`PUT` your session before assuming
+> LinkedIn is the problem; `GET /api/v1/session` will show `last_use_ok: null`
+> ("could not tell"), never a false `true`.
+
+**The cache is shared between callers, and that is a trade.** It is keyed by
+public id, not by caller, so a record fetched under one caller's session answers
+another's. The session check happens *before* the cache is consulted, so nobody
+without a working session of their own can reach it — but that is a control on
+*access*, not on *content*. LinkedIn's profile responses are viewer-relative:
+connection degree, and whatever privacy settings the member applies to people
+outside it, change what comes back. So a stale answer can be a slightly richer
+view than your own session would ever have retrieved live. This is accepted
+knowingly for a single-evaluator service; it would not be acceptable in a
+multi-tenant one, where the cache key would have to include the viewer.
+
+**Media URLs in a stale record expire.** The `images` URLs LinkedIn returns are
+signed and time-limited, so on a record served long after it was fetched they
+will `403`. They are deliberately **not** stripped: removing them would mean
+re-shaping the record on the way out, which is exactly what "served exactly as
+it was stored" forbids, and a missing `images` key would say "this member has no
+photo" — a claim about the member, when the truth is a fact about a URL. The
+field stays as it was fetched and `fetched_at` tells you how likely it still
+resolves.
+
+The records live in the same Postgres the session vault uses, in the `app`
+schema, and nothing about a session or a subject is stored beside them:
+
+```bash
+docker compose exec postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -c 'select public_id, fetched_at from app.profile_cache'
+```
+
+A cache write that fails never costs you the answer: if the datastore rejects
+the write on an otherwise successful fetch, the live `200` is returned anyway
+and the failure goes to the log — at `ERROR`, naming CAP-5, so a cache that has
+never once worked cannot be mistaken for one that simply has nothing in it yet.
 
 ### Prove the isolation (two callers, two sessions)
 
@@ -529,8 +666,12 @@ docker compose down -v && docker compose up -d --wait
 ```
 
 `-v` drops the `pgdata` volume — which is where Keycloak keeps its realms *and*
-where the session vault's table lives, so this destroys the realm and every
-stored session. The stack comes back healthy from empty volumes: the realm is
+where the session vault and the response cache live, so this destroys the realm,
+every stored session, and every cached profile. (Records never expire on their
+own, and **the application never removes one** — no TTL, no eviction, no delete
+endpoint. Dropping the volume, or a `DELETE` you run yourself in `psql`, is the
+only thing that does.) The stack comes back healthy from
+empty volumes: the realm is
 re-imported from the committed export, and the API recreates its schema on
 start. There is no migration step and no manual SQL, by decision — the schema
 is created by an idempotent bootstrap that runs on every boot (see `app/db.py`).
@@ -583,7 +724,22 @@ _To be written by story 9._
 
 <!-- STORY 9: name the specific failure modes from the brief addendum —
      session expiry, challenge pages, datacenter-IP reputation, unversioned
-     Voyager endpoints, unbounded stale-serve — not generic caveats. -->
+     Voyager endpoints, unbounded stale-serve — not generic caveats.
+
+     Story 7 verified three that belong here verbatim; all three are written up
+     under "When LinkedIn will not answer" and recorded in
+     _bmad-output/implementation-artifacts/deferred-work.md:
+
+     1. A dead li_at whose authwall arrives as a 200 classifies as
+        UPSTREAM_CHALLENGE (retryable) and IS stale-served indefinitely, so the
+        "SESSION_EXPIRED is never a stale 200" guarantee has a real gap.
+        Verified live, not theorised.
+     2. The response cache is keyed by profile and shared across callers, while
+        LinkedIn's retrieval is viewer-relative — so a stale answer can be a
+        richer view than the requesting caller's own session would produce.
+        Accepted for a single-evaluator service; not acceptable multi-tenant.
+     3. Media URLs in a stale record are signed and expire, so an old record's
+        images 403. Deliberately not stripped — see the README section. -->
 
 _To be written by story 9._
 
@@ -598,11 +754,16 @@ app/
                      the lifespan that bootstraps the database schema
   auth.py            JWKS-backed token validation, as a FastAPI dependency
   errors.py          the typed error envelope from response-schema.md
-  db.py              Postgres connections + the idempotent schema bootstrap.
-                     Application tables live in the `app` schema; Keycloak
-                     owns `public` in the same database
+  db.py              Postgres connections + the idempotent schema bootstrap, and
+                     the two stores (session, response cache). Application tables
+                     live in the `app` schema; Keycloak owns `public` in the same
+                     database
   vault.py           the encrypted per-subject session vault — the ONLY place a
                      stored li_at exists in plaintext
+  cache.py           the response cache and the stale-serve rule: fall back only
+                     when the failure is retryable and a usable record exists.
+                     No TTL, no eviction, no delete — unbounded by decision, so
+                     a record it cannot trust is ignored rather than removed
   api/
     health.py        unauthenticated GET /health
     v1/__init__.py   APIRouter(prefix="/api/v1") — the seam AND the auth boundary
@@ -627,6 +788,11 @@ tests/
   test_session_api.py  both session endpoints end to end against a real token
   test_mapping.py    the mapping matrix — absent versus unreadable, asserted
                      both ways for every section
+  test_cache.py      the stale-serve matrix — every non-retryable code that must
+                     NOT be answered from the cache, plus a resolver that checks
+                     every cache statement against the schema bootstrap creates
+                     (the cache is the one thing here that can break silently)
+  test_postgres_live.py  the opt-in database round-trip; skipped by default
   test_profile_api.py  GET /api/v1/profile end to end, stubbed client
   support.py         shared test helpers — the single seam between test modules
   test_linkedin_client.py  the retrieval edge-case matrix, entirely offline

@@ -28,9 +28,16 @@ and a grader use — collects this file and skips it::
 `app.config` is imported. Reading a separate one keeps this honest about what it
 is connecting to.
 
-**It writes only to its own rows.** Every subject used here is generated per run
-and prefixed, and the test deletes what it created. It never touches a row it
-did not write, so pointing it at the development stack costs nothing.
+Story 7's response cache is covered here for the same reason and by the same
+argument: the offline suite proves what `PostgresProfileCacheStore` executes,
+and only a real database can prove that `bootstrap` created the columns those
+statements name — and that the stored body comes back as the same characters,
+which is the story's central promise.
+
+**It writes only to its own rows.** Every subject and every public id used here
+is generated per run and prefixed, and the test deletes what it created. It
+never touches a row it did not write, so pointing it at the development stack
+costs nothing.
 """
 
 from __future__ import annotations
@@ -41,7 +48,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app import db
+from app import cache, db
+from app.errors import ApiError
 
 #: Both gates must open. The flag alone is not enough — a developer with a DSN
 #: exported for other reasons must not have this fire because they typed
@@ -57,8 +65,9 @@ pytestmark = [
     ),
 ]
 
-#: Every row this file writes carries it, so a stray row is identifiable and a
-#: cleanup that misses one is obvious in `psql`.
+#: Every row this file writes carries it — session subjects and cache public ids
+#: alike — so a stray row is identifiable and a cleanup that misses one is
+#: obvious in `psql`.
 SUBJECT_PREFIX = "pytest-live-"
 
 
@@ -86,10 +95,39 @@ def _store():
                 )
 
 
+@pytest.fixture(name="cache_store")
+def _cache_store():
+    """The real cache store, cleaning up after itself.
+
+    The cache table has no delete path in the application — stale-serve is
+    unbounded by decision — so this fixture issues the ``DELETE`` itself rather
+    than through the store. That is the correct shape: a test tidying up after
+    itself must not require production code that the spec says should not exist.
+    """
+    store = db.PostgresProfileCacheStore(connect_fn=_connect)
+    public_ids: list[str] = []
+
+    yield store, public_ids
+
+    with _connect() as connection:
+        with connection.cursor() as cursor:
+            for public_id in public_ids:
+                cursor.execute(
+                    f"DELETE FROM {db.CACHE_RELATION} WHERE public_id = %s",
+                    (public_id,),
+                )
+
+
 def _subject(subjects: list[str]) -> str:
     subject = SUBJECT_PREFIX + uuid.uuid4().hex
     subjects.append(subject)
     return subject
+
+
+def _public_id(public_ids: list[str]) -> str:
+    public_id = SUBJECT_PREFIX + uuid.uuid4().hex
+    public_ids.append(public_id)
+    return public_id
 
 
 def test_the_bootstrap_is_idempotent_against_a_real_database() -> None:
@@ -214,6 +252,195 @@ def test_a_stale_timestamp_that_matches_nothing_is_not_an_error(store) -> None:
         )
         is None
     )
+
+
+# --- The response cache table (story 7) ---------------------------------------
+
+
+def test_a_cached_response_round_trips_through_postgres(cache_store) -> None:
+    """The whole point of an offline-provable cache still needs the schema to exist.
+
+    Two things only a real database can settle: that ``bootstrap`` creates the
+    columns ``_CACHE_SAVE_SQL`` names, and that the body comes back as the same
+    characters it went in as. The second is the story's central promise — a
+    record is served exactly as it was stored — and a ``jsonb`` column would
+    quietly fail it by reordering keys, which is why the column is ``text``.
+    """
+    cache_store, public_ids = cache_store
+    db.bootstrap(attempts=1, retry_seconds=0, connect_fn=_connect)
+    public_id = _public_id(public_ids)
+    fetched_at = datetime.now(timezone.utc) - timedelta(days=3)
+    # Deliberately awkward: key order that JSON canonicalisation would change,
+    # non-ASCII, and an escaped NUL — which `jsonb` cannot store at all.
+    body = '{"url": "https://example.invalid", "z": 1, "a": "Plaçéholder\\u0000"}'
+
+    written = cache_store.save(public_id, body, cache.ENVELOPE_VERSION, fetched_at)
+    read = cache_store.load(public_id)
+
+    assert read == written
+    assert read.body == body
+    assert read.envelope_version == cache.ENVELOPE_VERSION
+    assert read.fetched_at.tzinfo is not None
+    assert read.fetched_at == fetched_at
+
+
+def test_a_load_never_returns_another_profiles_record(cache_store) -> None:
+    """Dropping the `WHERE` clause here answers one member with another's profile."""
+    cache_store, public_ids = cache_store
+    db.bootstrap(attempts=1, retry_seconds=0, connect_fn=_connect)
+    a, b = _public_id(public_ids), _public_id(public_ids)
+    now = datetime.now(timezone.utc)
+
+    cache_store.save(a, '{"who": "a"}', cache.ENVELOPE_VERSION, now)
+
+    assert cache_store.load(b) is None
+
+    cache_store.save(b, '{"who": "b"}', cache.ENVELOPE_VERSION, now)
+    assert cache_store.load(a).body == '{"who": "a"}'
+    assert cache_store.load(b).body == '{"who": "b"}'
+
+
+def test_a_second_save_replaces_rather_than_duplicating(cache_store) -> None:
+    """`public_id` is the PRIMARY KEY: one record per profile, enforced by the schema."""
+    cache_store, public_ids = cache_store
+    db.bootstrap(attempts=1, retry_seconds=0, connect_fn=_connect)
+    public_id = _public_id(public_ids)
+    first = datetime.now(timezone.utc) - timedelta(days=1)
+    second = datetime.now(timezone.utc)
+
+    cache_store.save(public_id, '{"n": 1}', cache.ENVELOPE_VERSION, first)
+    cache_store.save(public_id, '{"n": 2}', cache.ENVELOPE_VERSION, second)
+
+    read = cache_store.load(public_id)
+    assert read.body == '{"n": 2}'
+    assert read.fetched_at == second, "the replacement carries its own fetch time"
+    with _connect() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT count(*) FROM {db.CACHE_RELATION} WHERE public_id = %s",
+                (public_id,),
+            )
+            assert cursor.fetchone()[0] == 1
+
+
+def test_an_older_save_cannot_move_the_record_backwards(cache_store) -> None:
+    """The `ON CONFLICT ... WHERE` guard, against the real planner.
+
+    Two concurrent fetches for one profile finish in LinkedIn's order, not the
+    caller's, so a plain `DO UPDATE` lets the slower fetch's older body
+    overwrite the newer one and the record's `fetched_at` goes *down*. The
+    syntax of a `WHERE` on a `DO UPDATE` — and that a refused update returns no
+    row rather than raising — is exactly what an offline fake cannot settle.
+    """
+    cache_store, public_ids = cache_store
+    db.bootstrap(attempts=1, retry_seconds=0, connect_fn=_connect)
+    public_id = _public_id(public_ids)
+    newer = datetime.now(timezone.utc)
+    older = newer - timedelta(hours=6)
+
+    cache_store.save(public_id, '{"n": "new"}', cache.ENVELOPE_VERSION, newer)
+    refused = cache_store.save(public_id, '{"n": "old"}', cache.ENVELOPE_VERSION, older)
+
+    assert refused is None, "a refused update must return no row, not raise"
+    read = cache_store.load(public_id)
+    assert read.body == '{"n": "new"}'
+    assert read.fetched_at == newer
+
+
+def test_an_equally_timed_save_still_rewrites(cache_store) -> None:
+    """`<=`, not `<`: re-storing an identical fetch is a write, not a refusal."""
+    cache_store, public_ids = cache_store
+    db.bootstrap(attempts=1, retry_seconds=0, connect_fn=_connect)
+    public_id = _public_id(public_ids)
+    at = datetime.now(timezone.utc)
+
+    cache_store.save(public_id, '{"n": "first"}', cache.ENVELOPE_VERSION, at)
+    again = cache_store.save(public_id, '{"n": "second"}', cache.ENVELOPE_VERSION, at)
+
+    assert again is not None
+    assert cache_store.load(public_id).body == '{"n": "second"}'
+
+
+def test_a_very_old_record_is_still_returned(cache_store) -> None:
+    """Unbounded by decision. A TTL added to the SQL would fail here and nowhere else."""
+    cache_store, public_ids = cache_store
+    db.bootstrap(attempts=1, retry_seconds=0, connect_fn=_connect)
+    public_id = _public_id(public_ids)
+    ancient = datetime(2015, 1, 1, tzinfo=timezone.utc)
+
+    cache_store.save(public_id, '{"old": true}', cache.ENVELOPE_VERSION, ancient)
+
+    read = cache_store.load(public_id)
+    assert read is not None
+    assert read.fetched_at == ancient
+
+
+def test_the_whole_cache_round_trip_works_through_the_real_connection(
+    cache_store,
+) -> None:
+    """`ProfileCache` over `PostgresProfileCacheStore`, end to end.
+
+    Every offline test of `ProfileCache` runs over an in-memory double, and
+    every offline test of the store runs over a recording fake. Neither proves
+    the two fit together against a real database — which is the shape of the
+    failure this story's review found: five ways for the cache to be entirely
+    broken and entirely silent.
+    """
+    cache_store, public_ids = cache_store
+    db.bootstrap(attempts=1, retry_seconds=0, connect_fn=_connect)
+    public_id = _public_id(public_ids)
+    profile_cache = cache.ProfileCache(cache_store)
+    fetched_at = datetime.now(timezone.utc) - timedelta(days=2)
+    body = {
+        "url": f"https://www.linkedin.com/in/{public_id}",
+        "public_id": public_id,
+        "stale": False,
+        "fetched_at": fetched_at.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "partial": ["certifications"],
+        "profile": {"name": {"full": "Ada Plaçéholder"}},
+    }
+
+    assert profile_cache.remember(public_id, body, fetched_at) is True
+
+    served = profile_cache.fallback_for(public_id, ApiError("RATE_LIMITED"))
+
+    assert served.reason == cache.SERVED, served.reason
+    assert served.body == {**body, "stale": True}
+
+
+def test_the_cache_connections_statement_timeout_is_one_postgres_accepts() -> None:
+    """The half of the hang fix Postgres itself has to enforce.
+
+    `asyncio.timeout` frees the request but cannot cancel a thread already
+    inside the driver; only the server aborting the statement hands the worker
+    back. A malformed `options` string is accepted by nobody until libpq sends
+    it, so this connects with the real one and asks the backend what it got.
+
+    It builds the connection from `POSTGRES_LIVE_URL` rather than calling
+    `connect_for_cache` directly, because `tests/conftest.py` points
+    `DATABASE_URL` at nothing on purpose. That `connect_for_cache` passes THIS
+    constant is asserted offline, in `tests/test_cache.py`.
+    """
+    import psycopg
+
+    if not LIVE_URL:
+        pytest.skip("POSTGRES_LIVE_URL is not set; see this module's docstring")
+
+    with psycopg.connect(
+        LIVE_URL,
+        connect_timeout=db.CACHE_CONNECT_TIMEOUT_SECONDS,
+        options=f"-c statement_timeout={db.CACHE_STATEMENT_TIMEOUT_MS}",
+    ) as connection:
+        with connection.cursor() as cursor:
+            # `pg_settings`, not `SHOW`: the latter renders the value back in
+            # whatever unit reads most nicely (5000ms becomes "5s"), so
+            # comparing its string would fail on a setting that is correct.
+            cursor.execute(
+                "SELECT setting, unit FROM pg_settings WHERE name = 'statement_timeout'"
+            )
+            setting, unit = cursor.fetchone()
+            assert unit == "ms"
+            assert int(setting) == db.CACHE_STATEMENT_TIMEOUT_MS
 
 
 def test_an_unreachable_database_is_datastore_unavailable() -> None:
