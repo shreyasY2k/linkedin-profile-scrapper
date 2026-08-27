@@ -2,7 +2,7 @@
 title: 'Encrypted per-user LinkedIn session vault'
 type: 'feature'
 created: '2026-08-27'
-status: 'in-progress'
+status: 'done'
 baseline_commit: 'dc58f16d5dde492fbd92df464cd020b60b93bd62'
 review_loop_iteration: 0
 context:
