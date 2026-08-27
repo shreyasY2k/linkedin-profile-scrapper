@@ -505,6 +505,39 @@ def test_an_empty_section_and_a_failed_section_differ(name: str) -> None:
     assert name not in failed.profile and name in failed.partial
 
 
+@pytest.mark.parametrize("name", SECTION_FIELDS)
+def test_linkedins_own_empty_payload_maps_to_an_empty_array(name: str) -> None:
+    """The live wire shape, section by section, all the way to the contract.
+
+    The payload literal is LinkedIn's own answer for a member with none of
+    something, captured on 2026-08-27 from `identity/dash/profileSkills` — the
+    element list arrives under `elements`, not `*elements`, because an empty
+    collection has no references to normalize.
+
+    This is a regression test for a fault that reached production: the envelope
+    check accepted only `*elements`, so every genuinely empty section was
+    classified unreadable and `williamhgates` came back with skills,
+    certifications and languages in `partial[]` instead of as `[]`. The suite
+    stayed green throughout, because the fixture wrote the empty list under the
+    starred key — a shape LinkedIn does not emit.
+
+    Parametrized over all five sections deliberately. The bug was never about
+    skills; experience and education ran the identical code path and were
+    saved only by every profile tested happening to have entries.
+    """
+    payload = json.loads(
+        '{"data":{"entityUrn":"urn:li:collectionResponse:SYNTHETIC","elements":[],'
+        '"paging":{"count":100,"start":0,"total":0,"links":[]},'
+        '"$type":"com.linkedin.restli.common.CollectionResponse"},"included":[]}'
+    )
+
+    mapped = map_profile(raw_profile(overrides={name: ok_section(name, payload)}))
+
+    assert mapped.profile[name] == []
+    assert name in mapped.profile, "an empty section is an answer, not a gap"
+    assert name not in mapped.partial
+
+
 def test_one_failed_section_does_not_cost_the_others() -> None:
     """Degraded honestly: the rest of the profile still comes back."""
     raw = raw_profile(overrides={"languages": failed_section("languages")})

@@ -67,6 +67,14 @@ entities themselves live flat in ``included``, joined by ``entityUrn``. Reading
 ``data`` expecting nested objects returns nothing and looks like an empty
 profile. :func:`resolve_elements` performs the join.
 
+**An EMPTY collection is spelled differently, and this is measured, not
+inferred.** With nothing to point at there are no references to normalize, so
+the star disappears and ``data`` carries a plain ``"elements": []`` with
+``paging.total`` of 0. A section that insists on ``*elements`` therefore reads
+every genuinely empty section as a broken one — which is what shipped, and what
+:data:`EMPTY_ELEMENTS_KEY` documents and :func:`is_collection_envelope` now
+accepts.
+
 ===============================================================================
 COST
 ===============================================================================
@@ -642,6 +650,14 @@ def resolve_elements(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     no end date is in the mix.
 
     Reshaping nothing: the dicts returned are the payload's own objects.
+
+    Reads ``*elements`` only, and deliberately does **not** take the
+    :data:`EMPTY_ELEMENTS_KEY` alias that :func:`is_collection_envelope` and
+    :func:`element_urns` take. It needs nothing there: the alias exists solely
+    for the empty collection, and there is no difference between "join an empty
+    reference list" and "find no reference list" — both are correctly no
+    entities. Keeping the join keyed on the starred form also keeps it honest
+    about what it can actually do, which is resolve references and nothing else.
     """
     data = payload.get("data")
     included = payload.get("included")
@@ -670,18 +686,67 @@ def resolve_elements(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     return resolved
 
 
+#: The key LinkedIn uses for the element list when the collection is **empty**.
+#:
+#: The normalized envelope star-prefixes a list only when it actually holds URN
+#: *references* — ``*elements`` means "these are pointers, join them against
+#: ``included``". A collection with nothing in it has no references to
+#: normalize, so the star never appears and the plain key is emitted instead.
+#:
+#: **Verified live on 2026-08-27.** ``profileSkills`` for a member with no
+#: skills answers 200 with exactly this, 233 bytes end to end::
+#:
+#:     {"data": {"entityUrn": "urn:li:collectionResponse:...",
+#:               "elements": [],
+#:               "paging": {"count": 100, "start": 0, "total": 0, "links": []},
+#:               "$type": "com.linkedin.restli.common.CollectionResponse"},
+#:      "included": []}
+#:
+#: Measured the same day: ``williamhgates`` and ``satyanadella`` answer in this
+#: shape for skills, certifications and languages, while ``reidhoffman``
+#: answers the ordinary ``*elements`` shape with 47 skills. So it is the
+#: emptiness that selects the key, not the resource and not the viewer.
+#:
+#: The alias is honoured for the **empty list only**. A non-empty plain
+#: ``elements`` would carry inline objects rather than references, which
+#: :func:`resolve_elements` cannot join against ``included``; accepting it would
+#: produce a silently short list, which is the precise failure this module
+#: exists to prevent. That case stays unreadable.
+EMPTY_ELEMENTS_KEY = "elements"
+
+
+def _element_list(data: Any) -> list[Any] | None:
+    """``data``'s element list, or ``None`` when ``data`` is not a collection.
+
+    One accessor, so that "is this a collection at all" and "how many elements
+    does it have" cannot answer differently. They did: the envelope check
+    accepted only ``*elements`` while LinkedIn's empty form carries
+    :data:`EMPTY_ELEMENTS_KEY`, so every genuinely empty section was reported
+    unreadable — the exact absent-versus-unreadable error inverted.
+    """
+    if not isinstance(data, Mapping):
+        return None
+    urns = data.get("*elements")
+    if isinstance(urns, list):
+        return urns
+    if data.get(EMPTY_ELEMENTS_KEY) == []:
+        return []
+    return None
+
+
 def element_urns(payload: Mapping[str, Any]) -> list[str]:
     """The raw ``*elements`` URN list, which is what "how many" really means.
 
     Counted from ``data``, never from ``len(included)``: ``included`` can carry
     entities the elements list does not reference, and a section whose join
     fails would otherwise look empty rather than broken.
+
+    Reads through :func:`_element_list`, so LinkedIn's empty-collection form
+    counts as a measured zero rather than falling through the "not a list"
+    branch — the same answer, but for the stated reason.
     """
-    data = payload.get("data")
-    if not isinstance(data, Mapping):
-        return []
-    urns = data.get("*elements")
-    if not isinstance(urns, list):
+    urns = _element_list(payload.get("data"))
+    if urns is None:
         return []
     return [urn for urn in urns if isinstance(urn, str)]
 
@@ -716,16 +781,25 @@ def is_collection_envelope(payload: Mapping[str, Any]) -> bool:
     """Whether ``payload`` is a normalized collection response at all.
 
     The distinction this draws is the one the whole story turns on. A 200
-    carrying a body with no ``data``, or a ``data`` with no ``*elements``, is
-    **unreadable** — the shape changed, or something other than a collection
-    came back. Reading zero elements out of it and reporting "this section is
-    empty" tells a caller, in `response-schema.md`'s own terms, that the
-    profile *has none* of something we simply could not read.
+    carrying a body with no ``data``, or a ``data`` carrying neither of the two
+    element forms, is **unreadable** — the shape changed, or something other
+    than a collection came back. Reading zero elements out of it and reporting
+    "this section is empty" tells a caller, in `response-schema.md`'s own terms,
+    that the profile *has none* of something we simply could not read.
 
     So a malformed envelope is a failure, never an empty result.
+
+    **And the converse, which this predicate got wrong until 2026-08-27: an
+    empty collection is a result, never a failure.** There are two element
+    forms, not one — ``*elements`` when the collection holds references, and the
+    plain :data:`EMPTY_ELEMENTS_KEY` when it is empty and there is nothing to
+    normalize. Requiring the starred key made every genuinely empty section a
+    "malformed envelope", so a member with no skills was published as a member
+    whose skills we could not read. Both forms are collections; anything else,
+    including a *non-empty* plain ``elements``, is not. See
+    :data:`EMPTY_ELEMENTS_KEY` for why the alias stops at the empty list.
     """
-    data = payload.get("data")
-    return isinstance(data, Mapping) and isinstance(data.get("*elements"), list)
+    return _element_list(payload.get("data")) is not None
 
 
 def find_entity(payload: Mapping[str, Any], type_suffix: str) -> dict[str, Any] | None:

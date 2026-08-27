@@ -1,13 +1,13 @@
 {
   "data": {
-    "entityUrn": "urn:li:fsd_profileLanguageCollection:SYNTHETIC",
+    "entityUrn": "urn:li:collectionResponse:SYNTHETIC",
+    "elements": [],
     "paging": {
-      "count": 10,
+      "count": 100,
       "start": 0,
-      "links": [],
-      "total": 0
+      "total": 0,
+      "links": []
     },
-    "*elements": [],
     "$type": "com.linkedin.restli.common.CollectionResponse"
   },
   "included": []

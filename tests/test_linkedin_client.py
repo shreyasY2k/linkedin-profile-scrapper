@@ -453,27 +453,85 @@ def test_the_join_survives_a_malformed_envelope() -> None:
 # --- Empty section: never conflated with a failure ---------------------------
 
 
-def test_an_empty_section_is_a_success_with_zero_elements() -> None:
-    """Measured: `profileLanguages` gave 0 elements, then 3, minutes apart.
+@pytest.mark.parametrize("name", sorted(SECTION_RESOURCES))
+def test_an_empty_section_is_a_success_with_zero_elements(name: str) -> None:
+    """A zero-length section is not evidence that the profile has none.
 
-    A zero-length section is therefore not evidence that the profile has none.
     The client records "the call succeeded" and "it returned nothing" as two
     separate facts so that story 6 can map the first to `[]` and a *failure* to
     `partial[]` — getting this wrong publishes a confident falsehood about a
     real person.
+
+    `voyager_empty_section.json` is LinkedIn's own empty-collection wire shape
+    (see `EMPTY_ELEMENTS_KEY`), and getting it wrong here is not hypothetical:
+    with a fixture that wrote the empty list under `*elements` — a form
+    LinkedIn never emits — this assertion passed while production reported
+    every empty section unreadable.
+
+    Parametrized over **all five** sections rather than the three that were
+    observed failing. Nothing about this is specific to skills: experience and
+    education took the same path and merely never met a member without any.
     """
     client = make_client(
-        override("languages", json_response(load_fixture("voyager_empty_section.json")))
+        override(name, json_response(load_fixture("voyager_empty_section.json")))
     )
 
     profile = fetch(client)
-    languages = profile.sections["languages"]
+    section = profile.sections[name]
 
-    assert languages.ok is True
-    assert languages.element_count == 0
-    assert languages.payload is not None
-    assert languages.error_code is None
-    assert "languages" not in profile.failed_sections
+    assert section.ok is True
+    assert section.element_count == 0
+    assert section.reported_total == 0
+    assert section.payload is not None
+    assert section.error_code is None
+    assert profile.failed_sections == []
+
+
+def test_the_empty_collection_form_is_read_as_a_collection() -> None:
+    """The wire shape itself, byte for byte, at the predicate that misread it.
+
+    Captured live on 2026-08-27 from `identity/dash/profileSkills` for a member
+    with no skills. The whole body is 233 bytes and the element list arrives
+    under `elements`, not `*elements`: an empty collection has no references to
+    normalize, so the star never appears.
+    """
+    empty = json.loads(
+        '{"data":{"entityUrn":"urn:li:collectionResponse:SYNTHETIC","elements":[],'
+        '"paging":{"count":100,"start":0,"total":0,"links":[]},'
+        '"$type":"com.linkedin.restli.common.CollectionResponse"},"included":[]}'
+    )
+
+    assert voyager.is_collection_envelope(empty) is True
+    assert voyager.element_urns(empty) == []
+    assert voyager.resolve_elements(empty) == []
+    assert voyager.reported_total(empty) == 0
+
+
+def test_a_non_empty_plain_elements_list_is_still_unreadable() -> None:
+    """The alias stops at the empty list, and that boundary is load-bearing.
+
+    A *populated* `elements` would carry inline objects rather than URN
+    references, which `resolve_elements` cannot join against `included`.
+    Accepting it would publish a list of length zero for a collection LinkedIn
+    said holds two — a silently short answer, which is the failure the whole
+    absent-versus-unreadable distinction exists to prevent.
+    """
+    body = {
+        "data": {
+            "elements": [{"name": "Inline Skill"}, {"name": "Another"}],
+            "paging": {"count": 100, "start": 0, "total": 2, "links": []},
+        },
+        "included": [],
+    }
+    assert voyager.is_collection_envelope(body) is False
+
+    client = make_client(override("skills", json_response(body)))
+
+    skills = fetch(client).sections["skills"]
+
+    assert skills.ok is False
+    assert skills.element_count is None
+    assert skills.error_code == "UPSTREAM_ERROR"
 
 
 def test_a_failed_section_records_no_element_count_at_all() -> None:
