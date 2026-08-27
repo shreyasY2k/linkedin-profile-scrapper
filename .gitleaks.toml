@@ -1,0 +1,49 @@
+# gitleaks configuration. Picked up automatically by the pre-commit hook in
+# `.pre-commit-config.yaml` and by `gitleaks git`/`gitleaks dir` run by hand.
+#
+# The default rule set is kept in full. The only thing added is one narrow
+# allowlist, and it is narrow on purpose: an allowlist that silenced a whole
+# file, or a whole rule, would turn the secret scan into decoration — which is
+# the one thing story 9's history audit cannot afford.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = """
+The committed placeholder in .env.example, and nothing else.
+
+Story 5 requires SESSION_ENCRYPTION_KEY to be a real Fernet key: the API
+validates it at boot and refuses to start on an arbitrary passphrase, because a
+service that cannot encrypt must not accept a cookie. That forces the shipped
+placeholder to be a valid key too, or `cp .env.example .env && docker compose up`
+would die on a clean clone — which is CAP-7.
+
+A valid Fernet key is 44 characters of base64, so gitleaks' generic-api-key rule
+reads it as a credential. It is not one. Base64-decode this exact string and it
+says "change-me-generate-a-real-key!!!"; every clone has it, which is why
+.env.example, the README and app/config.py all say to generate your own.
+
+Matched by the LITERAL VALUE and by nothing else. Deliberately not by path: a
+`paths` entry makes gitleaks skip the whole file before it scans a line of it,
+so a real secret pasted into .env.example would sail through — verified, and
+the reason this file does not have one. A one-string allowlist can only ever
+silence that one string, wherever it appears.
+"""
+regexes = ['''^Y2hhbmdlLW1lLWdlbmVyYXRlLWEtcmVhbC1rZXkhISE=$''']
+
+[[allowlists]]
+description = """
+A Python type-annotation name, not a credential.
+
+gitleaks' `linkedin-client-id` rule fires on "linkedin" followed by a 14-16
+character token, so `linkedin_dev_cookie: OptionalSecret = Field(` reads as a
+leaked LinkedIn client id. `app/config.py` already dodges it by naming the type
+`OptionalSecretSetting` — see the comment at that declaration — but the story-4
+notes in `_bmad-output/` quote the shorter name in prose, and that quotation is
+in the committed history where a rename cannot reach it.
+
+Matched by the literal identifier and anchored, so it silences that one word and
+nothing that merely contains it.
+"""
+regexes = ['''^OptionalSecret$''']

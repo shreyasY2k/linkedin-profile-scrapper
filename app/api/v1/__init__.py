@@ -30,7 +30,17 @@ router = APIRouter(
     responses=UNAUTHENTICATED_RESPONSE,
 )
 
-# Stories 5-8 attach their routers here, e.g.:
+# Story 5: PUT|GET /api/v1/session. Imported after `router` exists, because
+# `session` imports nothing from this module and this module must be importable
+# on its own for `tests/test_auth.py`'s structural assertions.
+#
+# Note what the session router does NOT declare: any security dependency of its
+# own. It inherits the one above, which is the whole point of the placement.
+from app.api.v1 import session as session_routes  # noqa: E402
+
+router.include_router(session_routes.router)
+
+# Stories 6-8 attach theirs the same way, e.g.:
 #     from app.api.v1 import profile
 #     router.include_router(profile.router)
 #

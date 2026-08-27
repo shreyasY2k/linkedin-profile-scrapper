@@ -17,3 +17,18 @@ pydantic-settings==2.15.0
 # added for one GET against a service on the compose network.
 pyjwt==2.13.0
 cryptography==50.0.1
+
+# Story 5: the encrypted session vault's datastore.
+#
+# psycopg 3 rather than psycopg2: it is the maintained line, and `[binary]`
+# ships a prebuilt wheel — including `manylinux_2_28_aarch64` for cp313, which
+# is the Python and the architecture this image and the Oracle Ampere target
+# both are — so no libpq headers and no compiler enter the build.
+#
+# `[binary]` and NOT `[pool]`: connection pooling is a separate package, this
+# service answers a handful of requests during an evaluation, and the story's
+# boundaries put an extra runtime dependency behind "Ask First".
+#
+# Fernet encryption needs nothing new: `cryptography` is already here from
+# story 3, where it is PyJWT's asymmetric backend.
+psycopg[binary]==3.3.4

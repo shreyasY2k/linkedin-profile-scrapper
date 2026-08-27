@@ -10,6 +10,22 @@ from __future__ import annotations
 
 import os
 
+from cryptography.fernet import Fernet
+
+#: A real Fernet key, generated per session rather than written down.
+#:
+#: Story 5 makes ``SESSION_ENCRYPTION_KEY`` a *validated* Fernet key: importing
+#: ``app.vault`` builds the cipher, so a key that is merely a non-empty string
+#: kills the process at boot — which is the contract, and which the old
+#: ``"test-encryption-key"`` placeholder would trip on every import.
+#:
+#: Generated rather than committed for two reasons. No key material enters the
+#: repository, so gitleaks has nothing to find and nobody can copy a "known
+#: good" key into a deployment; and every session encrypts under a different
+#: key, so a test that accidentally depended on a fixed one fails immediately
+#: rather than on someone else's machine.
+SESSION_ENCRYPTION_KEY = Fernet.generate_key().decode()
+
 #: The complete env surface ``Settings`` reads.
 #:
 #: Values are assigned unconditionally, never via ``setdefault``: a developer
@@ -26,7 +42,7 @@ REQUIRED_ENV = {
     "KEYCLOAK_REALM": "test-realm",
     "KEYCLOAK_CLIENT_ID": "test-client",
     "KEYCLOAK_CLIENT_SECRET": "test-client-secret",
-    "SESSION_ENCRYPTION_KEY": "test-encryption-key",
+    "SESSION_ENCRYPTION_KEY": SESSION_ENCRYPTION_KEY,
 }
 
 for _name, _value in REQUIRED_ENV.items():
@@ -85,4 +101,8 @@ def pytest_configure(config: object) -> None:
     config.addinivalue_line(  # type: ignore[attr-defined]
         "markers",
         "live: hits the real LinkedIn API. Skipped unless LINKEDIN_LIVE_CHECK=1.",
+    )
+    config.addinivalue_line(  # type: ignore[attr-defined]
+        "markers",
+        "postgres: hits a real Postgres. Skipped unless POSTGRES_LIVE_CHECK=1.",
     )

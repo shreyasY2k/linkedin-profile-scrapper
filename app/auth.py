@@ -28,6 +28,7 @@ import binascii
 import json
 import logging
 import math
+import re
 import threading
 import time
 import urllib.error
@@ -35,8 +36,10 @@ import urllib.request
 from typing import Any, Callable
 
 import jwt
-from fastapi import Security
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import Request, Security
+from fastapi.openapi.models import OAuthFlowClientCredentials, OAuthFlows
+from fastapi.security import OAuth2
+from fastapi.security.utils import get_authorization_scheme_param
 
 from app.config import settings
 from app.errors import ApiError, unauthenticated
@@ -126,6 +129,22 @@ REQUIRED_CLAIMS: tuple[str, ...] = ("exp", "iat", "iss", "aud", "sub")
 #: signature, and ``aud`` equal to the client id, so otherwise indistinguishable
 #: — is presented as an access token.
 EXPECTED_TOKEN_TYPE = "Bearer"
+
+#: Cap on the ``sub`` claim. OIDC requires a subject to be a string no longer
+#: than 255 characters, and Keycloak issues UUIDs. Story 5 makes this claim the
+#: primary key of the session vault, so the bound is what stops a token from a
+#: compromised realm writing an unbounded key into the table.
+MAX_SUBJECT_LENGTH = 255
+
+#: Characters a subject may not contain.
+#:
+#: NUL is the one that matters and it is not theoretical: Postgres ``text``
+#: cannot store ``\x00``, psycopg raises on it, and story 5 writes this claim
+#: straight into a primary key — so a token carrying ``"sub": "a\x00b"`` would
+#: be a 500 on a path the matrix says must be a 401. The rest of the C0 range
+#: goes with it because a subject also reaches log lines, and a newline there
+#: forges a log record.
+_SUBJECT_UNSAFE_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 #: Tolerance for clock skew between Keycloak and this container, in seconds.
 #: Small on purpose: they run on the same host.
@@ -347,22 +366,82 @@ jwks_cache = JwksCache(JWKS_URL)
 
 # --- The dependency ----------------------------------------------------------
 
-#: ``auto_error=False`` so a missing or non-bearer header arrives here as
-#: ``None`` and leaves through the typed envelope. With ``auto_error=True``
-#: FastAPI would answer first, with its own ``{"detail": ...}`` body — which is
-#: not the shape ``response-schema.md`` fixes.
-bearer_scheme = HTTPBearer(
-    scheme_name="KeycloakBearer",
+#: The name the security scheme carries in the OpenAPI document.
+SECURITY_SCHEME_NAME = "KeycloakClientCredentials"
+
+
+class KeycloakClientCredentials(OAuth2):
+    """The realm's client-credentials lane, declared as an OAuth2 scheme.
+
+    Story 3 declared an ``http`` / ``bearer`` scheme, which is an accurate
+    description of what the API *accepts* and a useless one for ``/docs``:
+    Swagger renders it as a box to paste an already-minted token into. Declaring
+    the flow instead gives ``/docs`` an Authorize button that mints the token
+    itself from a client id and secret, which is what CAP-3's evaluator will
+    reach for before they reach for ``curl``.
+
+    Nothing about validation changes. The token still has to survive every check
+    in :func:`require_claims`; only the document's description of where a token
+    comes from is different.
+
+    **The advertised token URL is the EXTERNAL issuer.** ``KEYCLOAK_SERVER_URL``
+    is the in-network address this process fetches JWKS from — a compose service
+    name a browser cannot resolve. Swagger runs in the browser, so it must be
+    told ``KEYCLOAK_ISSUER_URL``, which is also the base of the ``iss`` claim
+    this validator requires. That those two are the same string by construction
+    (:data:`TOKEN_URL` is built from :data:`EXPECTED_ISSUER`) is exactly why
+    story 3 split the two settings: a token Swagger can obtain is, necessarily,
+    a token this API accepts.
+
+    ``OAuth2.__call__`` returns the raw ``Authorization`` header. This overrides
+    it to return the bearer credential, so :func:`require_claims` reads a token
+    rather than re-parsing a header, and a non-bearer or empty header arrives as
+    ``None`` exactly as it did under ``HTTPBearer``.
+    """
+
+    async def __call__(self, request: Request) -> str | None:
+        # `getlist`, not `get`. Starlette's `get` returns the FIRST occurrence
+        # and silently drops the rest, so a request carrying two Authorization
+        # headers is resolved to one without anyone being told which. That is a
+        # request-smuggling shape: an intermediary that picks the last header
+        # and a backend that picks the first disagree about who the caller is,
+        # and the disagreement is invisible in both logs. An ambiguous
+        # credential is refused rather than guessed at.
+        presented = request.headers.getlist("Authorization")
+        if len(presented) > 1:
+            logger.warning(
+                "Rejected request: %d Authorization headers presented", len(presented)
+            )
+            return None
+
+        authorization = presented[0] if presented else None
+        scheme, credentials = get_authorization_scheme_param(authorization or "")
+        if scheme.lower() != "bearer" or not credentials:
+            # `Authorization: potato`, `Basic ...`, `Bearer` with nothing after
+            # it, and no header at all all land here. `auto_error` is not used —
+            # FastAPI's own error would answer with `{"detail": ...}`, which is
+            # not the shape `response-schema.md` fixes.
+            return None
+        return credentials
+
+
+oauth2_scheme = KeycloakClientCredentials(
+    flows=OAuthFlows(
+        clientCredentials=OAuthFlowClientCredentials(tokenUrl=TOKEN_URL, scopes={})
+    ),
+    scheme_name=SECURITY_SCHEME_NAME,
     description=(
         "Access token from the realm's client_credentials lane: "
-        f"POST {TOKEN_URL} with grant_type=client_credentials."
+        f"POST {TOKEN_URL} with grant_type=client_credentials, your client id "
+        "and your client secret. The same two values work in the Authorize "
+        "dialog and in the README's `curl`."
     ),
     auto_error=False,
 )
 
 
 def require_claims(
-    credentials: HTTPAuthorizationCredentials | None = Security(bearer_scheme),
+    token: str | None = Security(oauth2_scheme),
 ) -> dict[str, Any]:
     """Verify the bearer token and return its claims.
 
@@ -374,14 +453,10 @@ def require_claims(
     ``claims: dict = Depends(require_claims)`` and take ``claims["sub"]`` — the
     Keycloak subject CAP-4 binds a stored session to.
     """
-    if credentials is None:
+    if not token:
         # Covers both "no Authorization header at all" and a header whose
         # scheme is not Bearer (`Authorization: potato`).
         raise _reject("no bearer credentials in the Authorization header", presented=False)
-
-    token = credentials.credentials
-    if not token:
-        raise _reject("empty bearer credential", presented=False)
 
     try:
         header = jwt.get_unverified_header(token)
@@ -460,6 +535,35 @@ def require_claims(
         raise _reject(f"iat is not a numeric timestamp: {_loggable(issued_at)}")
     if math.isnan(issued_at) or issued_at > time.time() + CLOCK_SKEW_LEEWAY_SECONDS:
         raise _reject("token was issued in the future")
+
+    # Story 5 makes `sub` the PRIMARY KEY of the session vault, so what this
+    # claim is — not merely that it is there — decides whether one caller can
+    # land in another caller's row. Checked here rather than in each route, so
+    # every story that binds to a subject inherits it.
+    #
+    # The division of labour with PyJWT is deliberate and worth stating, because
+    # it is the same belt-and-braces argument made for `iat` above:
+    #
+    #   * The TYPE check is currently redundant. PyJWT 2.13 defaults
+    #     `verify_sub` to True and its `_validate_sub` raises
+    #     `InvalidSubjectError` on a non-string `sub` before this line runs —
+    #     verified against the pin, and `tests/test_auth.py` asserts WHICH layer
+    #     refused so the redundancy stays visible rather than silently becoming
+    #     the only check. It is kept because that behaviour arrived in PyJWT
+    #     2.10 and a pin can move backwards as easily as forwards.
+    #   * The BLANK, LENGTH and CONTROL-CHARACTER checks are ours alone. PyJWT
+    #     accepts `""`, a megabyte-long subject, and one containing NUL — and
+    #     the last of those is a 500, not a 401, because Postgres `text` cannot
+    #     store `\x00`.
+    subject = claims.get("sub")
+    if not isinstance(subject, str):  # pragma: no cover - PyJWT refuses first
+        raise _reject(f"sub is not a string: {_loggable(subject)}")
+    if not subject.strip():
+        raise _reject("sub is blank")
+    if len(subject) > MAX_SUBJECT_LENGTH:
+        raise _reject(f"sub is {len(subject)} characters, over the cap")
+    if _SUBJECT_UNSAFE_RE.search(subject):
+        raise _reject("sub contains a control character")
 
     return claims
 

@@ -2,7 +2,8 @@
 title: 'Encrypted per-user LinkedIn session vault'
 type: 'feature'
 created: '2026-08-27'
-status: 'ready-for-dev'
+status: 'in-progress'
+baseline_commit: 'dc58f16d5dde492fbd92df464cd020b60b93bd62'
 review_loop_iteration: 0
 context:
   - '{project-root}/_bmad-output/specs/spec-linkedin-profile-scraper/SPEC.md'
@@ -70,16 +71,16 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `requirements.txt` — add a Postgres driver with an arm64 wheel; nothing else
-- [ ] `app/db.py` — connection handling plus schema bootstrap that is safe to run on every start — the deployed stack must come up on a cold volume unattended
-- [ ] `app/vault.py` — encrypt/decrypt with the key from settings, and the subject-keyed store/load — the only place the cookie is in plaintext
-- [ ] `app/api/v1/session.py` — `PUT` and `GET` exactly as `response-schema.md` fixes them
-- [ ] `app/api/v1/__init__.py` — mount the session router
-- [ ] `app/auth.py` — replace the bearer scheme with OAuth2 client-credentials pointing at the external token URL, so `/docs` shows an Authorize button that mints its own token
-- [ ] `app/errors.py` — any new typed code the matrix needs
-- [ ] `tests/test_vault.py` — every matrix row, including at-rest ciphertext and cross-subject isolation
-- [ ] `tests/test_session_api.py` — the two endpoints end to end against a real token
-- [ ] `README.md` — the store-your-session step, since CAP-3's second curl depends on it
+- [x] `requirements.txt` — add a Postgres driver with an arm64 wheel; nothing else
+- [x] `app/db.py` — connection handling plus schema bootstrap that is safe to run on every start — the deployed stack must come up on a cold volume unattended
+- [x] `app/vault.py` — encrypt/decrypt with the key from settings, and the subject-keyed store/load — the only place the cookie is in plaintext
+- [x] `app/api/v1/session.py` — `PUT` and `GET` exactly as `response-schema.md` fixes them
+- [x] `app/api/v1/__init__.py` — mount the session router
+- [x] `app/auth.py` — replace the bearer scheme with OAuth2 client-credentials pointing at the external token URL, so `/docs` shows an Authorize button that mints its own token
+- [x] `app/errors.py` — any new typed code the matrix needs
+- [x] `tests/test_vault.py` — every matrix row, including at-rest ciphertext and cross-subject isolation
+- [x] `tests/test_session_api.py` — the two endpoints end to end against a real token
+- [x] `README.md` — the store-your-session step, since CAP-3's second curl depends on it
 
 **Acceptance Criteria:**
 - Given two different Keycloak subjects, when each stores a session and reads it back, then neither can observe the other's value or presence.
@@ -101,6 +102,16 @@ context:
 **Migrations are deliberately out of scope, by decision (2026-08-27).** The human's call: no migration tool until the APIs are completely built, then introduce one. So this story creates its schema with an idempotent bootstrap that is safe on every start, and stories 6-8 do the same for anything they add. The trade-off accepted knowingly: no migration history and no down-path until a tool lands later. Do not add Alembic here.
 
 **Schema namespacing.** Keycloak owns `public` in this database. Application tables belong in their own schema so a Keycloak migration and an application migration can never collide — a deferred finding from story 1 that lands here.
+
+**The encryption key is required to be a real Fernet key — and the stricter option was considered and rejected.** `app/vault.py` builds the cipher at import, so an unusable `SESSION_ENCRYPTION_KEY` kills the process at boot with the variable named, exactly as story 1 fixed for every other setting. Deriving a key from an arbitrary passphrase was rejected: it would let a deployment that never replaced the `.env.example` placeholder boot happily under a key an attacker can guess, with no symptom at all.
+
+That forces the shipped placeholder to itself be a valid Fernet key, because `cp .env.example .env && docker compose up -d --wait` on a clean clone is CAP-7 and an acceptance criterion. **The stricter alternative — refuse to start on the shipped placeholder — was considered and rejected on exactly that ground**, and the trade-off it leaves is real: a deployment left on the placeholder encrypts successfully under a key printed in a public repository. The mitigation is loudness, not fatality. `build_cipher` compares the configured key against `SHIPPED_PLACEHOLDER_KEY` and logs `CRITICAL` on every start when they match. `tests/test_vault.py` asserts both halves — that it still boots, and that it shouts — so neither can be quietly dropped. If a later story decides the clean-clone convenience is not worth the risk, the change is one line and the test that pins the current choice names the alternative.
+
+**No DELETE or revoke endpoint, and the gap that leaves is recorded rather than closed.** The frozen block is explicit: `PUT` overwrite is the entire lifecycle in the Must tier. A review correctly observed the consequence — a caller whose `li_at` is compromised cannot clear it from the vault without supplying *another* valid cookie, so the remedy for "my credential leaked" is "give us a second credential". That is a genuine gap and it is **deferred, not dismissed**: closing it means renegotiating the frozen block with the human, which is not a developer's call. Logged in the deferred-work file for whoever does renegotiate. Note the exposure is bounded by the value being unreadable without the encryption key and returned by no endpoint, and that revoking at LinkedIn's end (log out everywhere) invalidates the cookie regardless of what this vault holds.
+
+**`PUT` verifies the cookie once, against `me`.** One cheap call, after the value is stored. It is what makes `last_use_ok` a real field rather than a permanently-null one that `response-schema.md`, the README and the OpenAPI descriptions all promise — and `app/linkedin/client.py:check_session` was written for this call site and says so. Three outcomes, and only one of them is evidence about the cookie: LinkedIn naming the session owner is `true`, LinkedIn refusing the session is `false`, and everything else (a throttle, a challenge, a timeout) leaves it `null`, because recording `false` for a LinkedIn outage would libel a working session. **Ordering is the safety property**: the value is stored *first*, so a verification that hangs or throws can never cost a caller the credential they pasted correctly. This is not "cookie repair" — nothing is refreshed or re-logged-in, and expiry is still only surfaced.
+
+**A second realm client exists so CAP-4 is demonstrable.** Every caller minting through one `client_credentials` client shares one service-account user and therefore one `sub` — verified: two mints of the original lane both returned `service-account-linkedin-profile-api`. Per-caller isolation was real in the code and impossible to show in a running stack, and two evaluators sharing the credentials would have silently overwritten each other's cookie. `deploy/keycloak/realm-linkedin.json` now ships a second confidential service-account client whose audience mapper names the *API's* client id, so its tokens are accepted by the same validator. The original client is untouched and remains THE evaluator lane.
 
 ## Verification
 

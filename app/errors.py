@@ -216,6 +216,13 @@ FALLBACK_CODES: dict[int, str] = {
     404: "NOT_FOUND",
     405: "METHOD_NOT_ALLOWED",
     422: "INVALID_REQUEST",
+    # Story 5: this API's OWN datastore is unreachable. `response-schema.md`
+    # has no row for that — every code in its table is a statement about the
+    # request or about LinkedIn — and inventing one would put the wire contract
+    # and `ERROR_SPECS` out of agreement. A 503 in the fallback set says the
+    # true thing without pretending to be taxonomy: the service is temporarily
+    # unable to answer, and `retryable` derives to True.
+    503: "SERVICE_UNAVAILABLE",
 }
 FALLBACK_CODE = "INTERNAL_ERROR"
 
@@ -228,6 +235,9 @@ FALLBACK_MESSAGES: dict[int, str] = {
     404: "No such resource.",
     405: "That method is not allowed on this resource.",
     422: "The request failed validation.",
+    # Never the driver's message: a psycopg error can quote the failing
+    # statement, and the upsert's parameters carry the stored ciphertext.
+    503: "The service could not reach its datastore. Try again shortly.",
 }
 FALLBACK_MESSAGE = "The server failed to handle this request."
 
@@ -300,6 +310,22 @@ async def validation_exception_handler(request: Request, exc: Exception) -> JSON
     return envelope(422)
 
 
+async def datastore_unavailable_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Render :class:`app.db.DatastoreUnavailable` as a typed 503.
+
+    Without this, any Postgres hiccup during a session request becomes a 500
+    whose code is ``INTERNAL_ERROR`` — which tells a caller their request was
+    the problem when it was not, and tells them nothing about whether retrying
+    helps. A 503 says both.
+
+    The exception carries only the psycopg exception's *class name*; the message
+    was already logged at the store. Nothing about the statement or its
+    parameters reaches the caller.
+    """
+    logger.error("Datastore unavailable at %s: %s", request.url.path, exc)
+    return envelope(503)
+
+
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """Last resort: a bug becomes a typed 500, never a naked one.
 
@@ -320,7 +346,13 @@ def install_error_handlers(application: FastAPI) -> None:
     so :mod:`tests.test_auth` asserts the wiring rather than trusting it, for
     every one of these handlers.
     """
+    # Imported here rather than at module scope: `app.db` imports `app.config`,
+    # and `app.errors` must stay importable by anything, including the config
+    # tests that deliberately run with a broken environment.
+    from app.db import DatastoreUnavailable
+
     application.add_exception_handler(ApiError, api_error_handler)
+    application.add_exception_handler(DatastoreUnavailable, datastore_unavailable_handler)
     application.add_exception_handler(StarletteHTTPException, http_exception_handler)
     application.add_exception_handler(RequestValidationError, validation_exception_handler)
     # Starlette routes bare `Exception` to ServerErrorMiddleware rather than to
@@ -341,3 +373,46 @@ UNAUTHENTICATED_RESPONSE: dict[int | str, dict[str, Any]] = {
         "description": "Missing, malformed, expired, wrong-issuer or wrong-audience token.",
     }
 }
+
+
+def error_responses(*codes: str) -> dict[int | str, dict[str, Any]]:
+    """OpenAPI ``responses`` fragment for the taxonomy codes a route can answer.
+
+    Built from :data:`ERROR_SPECS` rather than written per route, so the status
+    a route documents and the status it actually returns cannot disagree — the
+    generated document is the README's API documentation, and a documented 403
+    for a route that answers 428 is worse than no documentation at all.
+
+    Codes sharing a status are merged into one entry with both meanings listed,
+    because OpenAPI keys responses by status and the two 428s are exactly that
+    case.
+
+    Both failure modes are loud, and neither used to be. A code absent from the
+    taxonomy raised a bare ``KeyError`` naming nothing useful; and calling this
+    with no codes returned ``{}``, so a route asking to document its failures
+    silently documented none — the exact outcome the helper exists to prevent,
+    reached by a typo.
+    """
+    if not codes:
+        raise ValueError(
+            "error_responses() needs at least one code — an empty result would "
+            "silently document a route as having no failure modes"
+        )
+
+    merged: dict[int | str, dict[str, Any]] = {}
+    for code in codes:
+        if code not in ERROR_SPECS:
+            raise KeyError(
+                f"{code!r} is not in ERROR_SPECS. Every code this API documents "
+                "must come from the table in response-schema.md; add the row "
+                "there and here before documenting it on a route."
+            )
+        spec = ERROR_SPECS[code]
+        entry = merged.setdefault(
+            spec.status_code, {"model": ErrorEnvelope, "description": ""}
+        )
+        line = f"`{code}` — {spec.message}"
+        entry["description"] = (
+            f"{entry['description']} {line}".strip() if entry["description"] else line
+        )
+    return merged

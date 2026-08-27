@@ -37,8 +37,64 @@
       "consentRequired": false,
       "fullScopeAllowed": false,
       "redirectUris": [],
+      "webOrigins": [
+        "http://127.0.0.1:8000",
+        "https://shreyaskaushik.dpdns.org"
+      ],
+      "defaultClientScopes": [
+        "basic",
+        "profile",
+        "email"
+      ],
+      "optionalClientScopes": [],
+      "attributes": {
+        "access.token.signed.response.alg": "RS256",
+        "use.refresh.tokens": "false",
+        "client_credentials.use_refresh_token": "false",
+        "oauth2.device.authorization.grant.enabled": "false",
+        "oidc.ciba.grant.enabled": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "${KEYCLOAK_CLIENT_ID}",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true",
+            "lightweight.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "${KEYCLOAK_SECOND_CLIENT_ID}",
+      "name": "LinkedIn Profile API second caller",
+      "description": "A second confidential service-account client, so two distinct Keycloak subjects exist and CAP-4's per-caller session isolation is demonstrable. NOT the evaluator lane - that is the client above. See .env.example.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "bearerOnly": false,
+      "secret": "${KEYCLOAK_SECOND_CLIENT_SECRET}",
+      "clientAuthenticatorType": "client-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "frontchannelLogout": false,
+      "surrogateAuthRequired": false,
+      "consentRequired": false,
+      "fullScopeAllowed": false,
+      "redirectUris": [],
       "webOrigins": [],
-      "defaultClientScopes": ["basic", "profile", "email"],
+      "defaultClientScopes": [
+        "basic",
+        "profile",
+        "email"
+      ],
       "optionalClientScopes": [],
       "attributes": {
         "access.token.signed.response.alg": "RS256",

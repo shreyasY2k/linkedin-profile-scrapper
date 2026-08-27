@@ -66,6 +66,37 @@ RequiredSetting = Annotated[
 RequiredBaseUrl = Annotated[RequiredSetting, AfterValidator(_normalise_base_url)]
 
 
+def _require_secret_content(value: SecretStr) -> SecretStr:
+    """Strip a required secret and refuse a blank one.
+
+    The ``SecretStr`` equivalent of :data:`RequiredSetting`. ``StringConstraints``
+    cannot be applied to ``SecretStr`` — it constrains ``str`` — so the strip and
+    the non-blank check are done here, and a *new* ``SecretStr`` is returned so
+    the stripped value is what every consumer reads. Without the strip, a
+    trailing space on a ``.env`` line would become part of an encryption key.
+    """
+    stripped = value.get_secret_value().strip()
+    if not stripped:
+        raise ValueError("must not be empty or whitespace-only")
+    return SecretStr(stripped)
+
+
+#: A required setting whose value is a credential.
+#:
+#: ``SecretStr`` rather than ``str``, for the reason already argued at
+#: :data:`OptionalSecretSetting` below and now applied to the fields that need
+#: it most: ``repr``, ``str``, a traceback and ``model_dump()`` all render
+#: ``**********``. ``Settings`` is a module-level singleton imported at boot, so
+#: it is exactly the kind of object that ends up in a debug dump or a frame
+#: local in a traceback — and one of these fields is the master key protecting
+#: every stored LinkedIn session.
+#:
+#: Reading the value requires the explicit, greppable ``.get_secret_value()``,
+#: which is what makes "where is the encryption key read?" a question `grep`
+#: can answer.
+RequiredSecret = Annotated[SecretStr, AfterValidator(_require_secret_content)]
+
+
 def _blank_secret_is_absent(value: Optional[SecretStr]) -> Optional[SecretStr]:
     """Treat a present-but-empty optional secret as unset.
 
@@ -119,7 +150,12 @@ class Settings(BaseSettings):
     )
 
     # --- Datastore ----------------------------------------------------------
-    database_url: RequiredSetting = Field(
+    # `RequiredSecret`, not `RequiredSetting`: this URL EMBEDS THE POSTGRES
+    # PASSWORD. As a plain `str` it renders in `repr(settings)`, in
+    # `settings.model_dump()`, and in any traceback frame holding the settings
+    # object — which is how a database password reaches a log that nobody
+    # thought was sensitive.
+    database_url: RequiredSecret = Field(
         description=(
             "DBAPI URL for the Postgres instance shared with Keycloak. Inside "
             "compose this is composed from the POSTGRES_* parts and injected "
@@ -162,13 +198,21 @@ class Settings(BaseSettings):
     keycloak_client_id: RequiredSetting = Field(
         description="Client the API validates the token audience against.",
     )
-    keycloak_client_secret: RequiredSetting = Field(
+    keycloak_client_secret: RequiredSecret = Field(
         description="Confidential client secret used for the service-account lane.",
     )
 
     # --- Application secrets ------------------------------------------------
-    session_encryption_key: RequiredSetting = Field(
-        description="Key encrypting stored LinkedIn session cookies at rest.",
+    #
+    # The master key. Every stored LinkedIn session in the database is readable
+    # to anyone holding this value, which is precisely why it must not be
+    # renderable by accident — see `RequiredSecret` above.
+    session_encryption_key: RequiredSecret = Field(
+        description=(
+            "Fernet key encrypting stored LinkedIn session cookies at rest. "
+            "Must be 32 url-safe base64-encoded bytes; app/vault.py validates "
+            "it at import, so an unusable key kills the process at boot."
+        ),
     )
 
     # --- Developer-only, optional -------------------------------------------

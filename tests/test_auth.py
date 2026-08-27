@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
 import time
 from pathlib import Path
@@ -586,6 +587,92 @@ def test_a_token_without_sub_is_401(client: TestClient) -> None:
     assert_unauthenticated(client.get(PROBE_PATH, headers=bearer(make_token(sub=_ABSENT))))
 
 
+#: `sub` values that must be refused, and WHICH layer is expected to refuse
+#: each one. The second half is the point of the table.
+#:
+#: Without it, five of these eight pass whether or not the guard in
+#: `require_claims` exists at all — pinned PyJWT 2.13 defaults `verify_sub` to
+#: True and its `_validate_sub` rejects a non-string `sub` before the guard
+#: runs. A parametrised "all eight are 401" test therefore looks like eight
+#: assertions about our code and is really three, and deleting the three checks
+#: that ARE ours would still leave it green for the other five.
+#:
+#: So each case names the log fragment the refusing layer emits. PyJWT's own
+#: rejections surface through `_reject` as `InvalidSubjectError`; ours name the
+#: specific rule.
+UNUSABLE_SUBJECTS = [
+    # Refused by PyJWT, before our guard is reached. Kept in the table so a
+    # PyJWT downgrade that stops refusing them fails HERE rather than silently
+    # widening what this API accepts.
+    (1, "InvalidSubjectError"),
+    (True, "InvalidSubjectError"),
+    ([], "InvalidSubjectError"),
+    ({}, "InvalidSubjectError"),
+    # `null` never even reaches the subject validator: PyJWT's required-claims
+    # check reads `payload.get(claim) is None`, so a present-but-null `sub` is
+    # indistinguishable from an absent one and dies as a missing claim.
+    (None, "MissingRequiredClaimError"),
+    # Refused by us, and by nothing else. PyJWT accepts all three.
+    ("", "sub is blank"),
+    ("   ", "sub is blank"),
+    ("x" * 256, "over the cap"),
+    ("has\x00a-nul", "control character"),
+    ("has\na-newline", "control character"),
+]
+
+
+@pytest.mark.parametrize(("subject", "reason"), UNUSABLE_SUBJECTS)
+def test_a_sub_that_is_not_a_usable_subject_is_401(
+    client: TestClient, caplog: pytest.LogCaptureFixture, subject: object, reason: str
+) -> None:
+    """`require` checks that `sub` is PRESENT, never what it is.
+
+    Story 5 makes `sub` the PRIMARY KEY of the session vault. A blank one pools
+    every such caller into a single shared row, which is CAP-4's isolation
+    inverted; one containing NUL is a 500 on the database write, because
+    Postgres `text` cannot store it; an unbounded one is an unbounded key.
+    None of that is something a route should have to remember to check.
+
+    The `reason` assertion is what keeps this honest about which layer did the
+    refusing — see `UNUSABLE_SUBJECTS`.
+    """
+    with caplog.at_level(logging.WARNING, logger="app.auth"):
+        response = client.get(PROBE_PATH, headers=bearer(make_token(sub=subject)))
+
+    assert_unauthenticated(response)
+    assert reason in caplog.text, (
+        f"expected {reason!r} to appear in the rejection log; got: {caplog.text}"
+    )
+
+
+def test_the_blank_and_control_character_rules_are_ours_alone() -> None:
+    """The three cases above that PyJWT does NOT catch, asserted directly.
+
+    Proves the claim in `UNUSABLE_SUBJECTS` rather than asserting it in a
+    comment: if a future PyJWT starts refusing these too, this test says so and
+    the guard can be reconsidered deliberately.
+    """
+    from jwt.exceptions import InvalidSubjectError
+
+    for accepted in ("", "   ", "x" * 256, "has\x00a-nul", "has\na-newline"):
+        # `_validate_sub` is what `verify_sub` runs. It must NOT object to any
+        # of these — which is precisely why `require_claims` checks them itself.
+        jwt.PyJWT()._validate_sub({"sub": accepted})
+
+    # And it MUST object to the one it owns, or the pragma'd branch in
+    # `require_claims` is wrong about who refuses first.
+    with pytest.raises(InvalidSubjectError):
+        jwt.PyJWT()._validate_sub({"sub": 1})
+
+
+def test_an_ordinary_subject_is_still_accepted(client: TestClient) -> None:
+    """The check above must be a type guard, not a rejection of every token."""
+    response = client.get(PROBE_PATH, headers=bearer(make_token()))
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"sub": SUBJECT}
+
+
 # --- Failing closed ----------------------------------------------------------
 
 
@@ -845,15 +932,67 @@ def test_health_ignores_a_broken_token(client: TestClient) -> None:
 # --- The OpenAPI document ----------------------------------------------------
 
 
-def test_openapi_advertises_bearer_on_v1_and_not_on_health(client: TestClient) -> None:
+def test_openapi_advertises_client_credentials_on_v1_and_nothing_on_health(
+    client: TestClient,
+) -> None:
+    """Story 5 replaced story 3's `http`/`bearer` scheme, deliberately.
+
+    A bare bearer scheme renders in `/docs` as a box to paste an already-minted
+    token into. Declaring the flow gives the Authorize button a token endpoint
+    to mint from, which is what an evaluator will reach for first. The half of
+    story 3's assertion that must NOT weaken is the second one: `/health`
+    carries no security and never will.
+    """
     document = client.get("/openapi.json").json()
 
-    scheme = document["components"]["securitySchemes"]["KeycloakBearer"]
-    assert scheme["type"] == "http"
-    assert scheme["scheme"] == "bearer"
+    scheme = document["components"]["securitySchemes"][auth.SECURITY_SCHEME_NAME]
+    assert scheme["type"] == "oauth2"
+    assert set(scheme["flows"]) == {"clientCredentials"}
 
-    assert document["paths"][PROBE_PATH]["get"]["security"] == [{"KeycloakBearer": []}]
+    assert document["paths"][PROBE_PATH]["get"]["security"] == [
+        {auth.SECURITY_SCHEME_NAME: []}
+    ]
     assert "security" not in document["paths"]["/health"]["get"]
+
+
+def test_the_advertised_token_url_is_the_external_issuer(client: TestClient) -> None:
+    """Swagger runs in a browser; it cannot resolve the compose service name.
+
+    `KEYCLOAK_SERVER_URL` is where THIS PROCESS fetches JWKS. Advertising it as
+    the token URL would give `/docs` an Authorize button that can never
+    connect — and the two settings exist separately precisely so that cannot
+    happen by accident. Building the token URL from `EXPECTED_ISSUER` also means
+    a token Swagger can obtain is necessarily a token this API accepts, because
+    `iss` is checked against the same string.
+    """
+    document = client.get("/openapi.json").json()
+    scheme = document["components"]["securitySchemes"][auth.SECURITY_SCHEME_NAME]
+
+    token_url = scheme["flows"]["clientCredentials"]["tokenUrl"]
+
+    assert token_url == (
+        f"{settings.keycloak_issuer_url}"
+        f"/realms/{settings.keycloak_realm}/protocol/openid-connect/token"
+    )
+    assert token_url == auth.TOKEN_URL
+    assert not token_url.startswith(settings.keycloak_server_url)
+
+
+def test_the_realm_client_allows_the_docs_page_to_mint() -> None:
+    """The Authorize button posts from the browser, so Keycloak needs an origin.
+
+    Without a web origin on the client, Keycloak's token endpoint omits the
+    CORS headers and the browser discards the response — the button appears,
+    the mint fails, and nothing in either log says why. `*` rather than a list
+    of hosts because the same export serves `http://127.0.0.1:8000/docs` and the
+    deployed HTTPS name, and this client is confidential: an origin without the
+    client secret still gets nothing.
+    """
+    origins = _api_client(_realm_export())["webOrigins"]
+
+    assert origins, (
+        "the client needs a web origin or /docs' Authorize button cannot mint"
+    )
 
 
 def test_openapi_documents_the_typed_401_body(client: TestClient) -> None:
@@ -1306,3 +1445,43 @@ def test_compose_imports_the_realm_export() -> None:
     assert "./deploy/keycloak:/opt/keycloak/data/import:ro" in compose
     assert "realm-linkedin.json:/opt/keycloak" not in compose
     assert REALM_EXPORT.parent.is_dir()
+
+
+#: Keycloak stores `name` and `description` on a client in `varchar(255)`.
+#:
+#: Not a style rule. A longer value aborts the ENTIRE realm import with
+#: `ERROR: value too long for type character varying(255)`, Keycloak exits
+#: non-zero, and `docker compose up -d --wait` fails with the cause in the
+#: keycloak log and nothing at all in the API's — which is exactly how a
+#: well-meant paragraph of explanation in an export takes the whole stack down.
+#: Found the hard way while adding the second client.
+KEYCLOAK_VARCHAR_LIMIT = 255
+
+#: Fields on a client that land in one of those columns.
+LENGTH_LIMITED_CLIENT_FIELDS = ("name", "description")
+
+
+@pytest.mark.parametrize("field", LENGTH_LIMITED_CLIENT_FIELDS)
+def test_no_client_field_overflows_keycloaks_column(field: str) -> None:
+    """Explanation belongs in .env.example and the story, which have room."""
+    for client in _realm_export()["clients"]:
+        value = client.get(field, "")
+        assert len(value) <= KEYCLOAK_VARCHAR_LIMIT, (
+            f"{client['clientId']}.{field} is {len(value)} characters; anything "
+            f"over {KEYCLOAK_VARCHAR_LIMIT} aborts the realm import and the "
+            "whole stack fails to come up"
+        )
+
+
+def test_the_web_origins_are_scoped_to_real_origins() -> None:
+    """`*` would open CORS on the token endpoint to every origin on the web.
+
+    The client is confidential, so an origin without the secret still gets
+    nothing — but a wildcard is a larger surface than this needs, and the only
+    two origins that exist are the local `/docs` and the deployed name.
+    """
+    origins = _api_client(_realm_export())["webOrigins"]
+
+    assert origins, "the client needs a web origin or /docs' Authorize button cannot mint"
+    assert "*" not in origins, "scope CORS to the origins that actually exist"
+    assert "http://127.0.0.1:8000" in origins

@@ -157,7 +157,7 @@ Auth attaches to the **router**, not to individual routes, so a later route inhe
 | 2 | Deploy through LB and nginx | **Done** — live at https://shreyaskaushik.dpdns.org |
 | 3 | Keycloak realm, clients, JWT validation | Done |
 | 4 | Voyager client, raw JSON | In progress |
-| 5 | Encrypted per-user session vault | Pending |
+| 5 | Encrypted per-user session vault | Done — `PUT`/`GET /api/v1/session`, Fernet at rest, keyed on `sub` |
 | 6 | Profile extraction and schema mapping | Pending — the graded core |
 | 7 | Response cache with stale-serve | Pending |
 | 8 | Error taxonomy and handlers | Pending |
@@ -174,3 +174,11 @@ Auth attaches to the **router**, not to individual routes, so a later route inhe
 | TLS terminates at the load balancer | Cloudflare→LB is encrypted; the only plaintext hop is LB→instance inside the private VCN, never the public internet |
 | Load-balancer health check probes `GET /`, proxied to `/health` | The check must be *truthful*: 200 only while the API really answers. A static 200 would report a dead backend as healthy |
 | 428 for missing/expired session | The caller has a fixable missing precondition, which is exactly what 428 means |
+| No migration tool; an idempotent bootstrap on every start | Human's call (2026-08-27): introduce one once the APIs are built. Until then the deployed stack must come up on a cold volume with no manual step, and `CREATE ... IF NOT EXISTS` at boot does that. Accepted knowingly: no migration history, no down-path |
+| Application tables in an `app` schema, not `public` | Keycloak owns `public` in the same database and migrates it on every version bump. Separate schemas mean the two can never collide over a name |
+| `SESSION_ENCRYPTION_KEY` must be a real Fernet key, validated at import | Stretching an arbitrary passphrase into a key would let a deployment left on the `.env.example` placeholder boot happily under a key anyone can guess. Failing at boot names the variable; failing at the first `PUT` does not |
+| Two service-account clients in the realm, not one | One `client_credentials` client is one service-account user and therefore ONE `sub`. Per-caller isolation was real in code and undemonstrable in the deployment, and two evaluators sharing the credentials would silently overwrite each other's cookie. The second client is a second subject and nothing else; the first stays the evaluator lane |
+| The subject is encrypted *inside* the ciphertext, not merely stored beside it | Fernet has no associated-data parameter, so its tag proves "written with the key", not "written for this row". Without the binding, anyone who can write the table but not read the key can move A's session into B's row and B runs under A's LinkedIn identity |
+| `PUT` verifies the cookie once against `me`, after storing it | It is what makes `last_use_ok` a real field rather than a permanently-null one the schema promises. Stored first, always: a LinkedIn outage must never cost a caller the credential they pasted correctly |
+| Datastore failure is a 503 from the fallback set, not a taxonomy code | `response-schema.md`'s table says things about the request or about LinkedIn. "Our own Postgres is down" is neither, and inventing a row would put the wire contract and `ERROR_SPECS` out of agreement |
+| `/docs` advertises the client-credentials flow, not a bare bearer scheme | A bearer scheme renders as a box to paste a token into. The flow gives the Authorize button a token endpoint — the **external** issuer, since the browser cannot resolve the compose service name |

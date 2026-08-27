@@ -1648,6 +1648,9 @@ def test_the_raw_profile_does_not_carry_the_cookie_anywhere() -> None:
 #: to edit the test without reading it.
 COOKIE_HANDLING_MODULES = {
     "app/linkedin/client.py",  # builds the request header — the only caller
+    # Story 5, and the two that were predicted above:
+    "app/vault.py",  # encrypts and decrypts it; the ONLY place it is plaintext
+    "app/api/v1/session.py",  # names it as the PUT body field response-schema.md fixes
 }
 
 
