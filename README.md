@@ -3,18 +3,126 @@
 Accepts a LinkedIn profile URL and returns the profile as structured JSON,
 retrieved under the caller's own LinkedIn session.
 
-> **This README is incomplete.** Story 1 wrote the **Setup** section; story 3
-> added **Get a token** to it, including the first of the two copy-paste `curl`
-> commands CAP-3 is graded on; story 5 added **Store your LinkedIn session**,
-> which the second `curl` depends on; story 6 added **Fetch a profile**, which
-> is that second `curl`; story 7 added **When LinkedIn will not answer**, which
-> is what `stale` means. Story 9 owns the remaining three required sections —
-> **API documentation**, **Approach**, and **Known limitations**. Placeholders
-> below mark where they go. Do not delete the placeholders; fill them.
+**Live at <https://shreyaskaushik.dpdns.org>.** Interactive API documentation:
+<https://shreyaskaushik.dpdns.org/docs>.
+
+Four sections, in the order the assignment asks for them: **[Setup](#setup)**,
+**[API documentation](#api-documentation)**, **[Approach](#approach)**,
+**[Known limitations](#known-limitations)**. Everything else is a subsection of
+one of them.
 
 ---
 
 ## Setup
+
+### Run it against the deployed service — the two graded commands
+
+Nothing to install, nothing to clone, no file to source. Copy these two blocks
+into any shell with `curl` and `python3` and they work as written.
+
+**1 — mint a token.**
+
+```bash
+curl -fsS -X POST \
+  -d grant_type=client_credentials \
+  -d client_id=linkedin-profile-api \
+  -d client_secret=REPLACE_WITH_EVALUATOR_CLIENT_SECRET \
+  https://shreyaskaushik.dpdns.org/realms/linkedin/protocol/openid-connect/token
+```
+
+That returns `{"access_token": "eyJ...", "expires_in": 900, ...}`.
+
+**2 — fetch a profile with it.**
+
+```bash
+TOKEN=$(curl -fsS -X POST \
+  -d grant_type=client_credentials \
+  -d client_id=linkedin-profile-api \
+  -d client_secret=REPLACE_WITH_EVALUATOR_CLIENT_SECRET \
+  https://shreyaskaushik.dpdns.org/realms/linkedin/protocol/openid-connect/token \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+
+curl -sS -G https://shreyaskaushik.dpdns.org/api/v1/profile \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode 'url=https://www.linkedin.com/in/williamhgates' \
+  | python3 -m json.tool
+```
+
+A populated profile comes back. **You do not have to supply a LinkedIn cookie
+first** — the `linkedin-profile-api` client's vault row is pre-seeded with a
+working session so that these two commands stand alone, which is the whole point
+of them. That convenience has a real cost, and it is the first entry under
+[Known limitations](#the-evaluator-lane-runs-under-the-authors-own-linkedin-session).
+
+> ### About that client secret
+>
+> `REPLACE_WITH_EVALUATOR_CLIENT_SECRET` is a **real, working credential,
+> published here on purpose.** The assignment is graded on two `curl` commands
+> running verbatim from a machine that has never authenticated, and a
+> placeholder cannot satisfy that. So the trade was made deliberately and is
+> stated rather than hidden:
+>
+> - It reaches **only this evaluation service**. It is a Keycloak
+>   `client_credentials` secret for one confidential client in one realm on one
+>   host. It is not reused anywhere, it unlocks no other system, and it grants
+>   nothing beyond calling the three routes below.
+> - It is **permanent in the git history** from the moment this repository is
+>   published. Rewriting history would not recall a published secret.
+> - **It should be rotated after grading.** Rotate it in the Keycloak admin
+>   console (reachable only over an SSH tunnel to `127.0.0.1:8080`) and mirror
+>   the new value into the instance's `.env`. The realm export is imported
+>   `IGNORE_EXISTING`, so editing `.env` alone will not change an existing
+>   realm — see [Reset the stack](#reset-the-stack).
+>
+> It is the **only** real credential anywhere in this repository. `.gitleaks.toml`
+> allowlists it **by its literal value**, not by path, so the secret scan stays
+> a real scan — see [Secret scanning](#secret-scanning).
+
+### Use your own LinkedIn session instead — the third command
+
+The two commands above ride on a pre-seeded session. The model this service was
+actually built on is **bring your own**: you upload your own `li_at` once, it is
+encrypted at rest and bound to your token's subject, and every profile request
+you make runs under it. One `PUT` switches the evaluator lane over to your
+cookie:
+
+```bash
+TOKEN=$(curl -fsS -X POST \
+  -d grant_type=client_credentials \
+  -d client_id=linkedin-profile-api \
+  -d client_secret=REPLACE_WITH_EVALUATOR_CLIENT_SECRET \
+  https://shreyaskaushik.dpdns.org/realms/linkedin/protocol/openid-connect/token \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+
+# LinkedIn → DevTools → Application → Cookies → https://www.linkedin.com → li_at
+read -rs -p 'Paste your li_at: ' LI_AT; echo   # -s: not echoed, not in history
+
+LI_AT="$LI_AT" python3 -c 'import json,os;print(json.dumps({"li_at":os.environ["LI_AT"]}))' \
+  | curl -fsS -X PUT \
+      -H "Authorization: Bearer $TOKEN" \
+      -H 'content-type: application/json' \
+      --data-binary @- \
+      https://shreyaskaushik.dpdns.org/api/v1/session
+# {"stored":true,"stored_at":"...","last_used_at":"...","last_use_ok":true}
+
+unset LI_AT
+```
+
+`PUT` **overwrites** — it replaces whatever session is stored for your subject,
+including the pre-seeded one, and there is no undo and no delete endpoint. If
+you would rather not disturb the graded lane, mint with
+`linkedin-profile-api-second` instead (see
+[Prove the isolation](#prove-the-isolation-two-callers-two-sessions)); it is a
+different Keycloak service account and therefore a different vault row.
+
+`last_use_ok: true` in the reply is not decoration — the service spent one call
+on LinkedIn's `me` endpoint with the cookie you just sent, so `true` means it
+works right now. Everything the endpoint does, and deliberately does not do, is
+under [Store your LinkedIn session](#store-your-linkedin-session).
+
+The rest of this section is about running the stack **locally**. If you only
+want to exercise the deployed service, skip to
+[API documentation](#api-documentation).
 
 ### Requirements
 
@@ -26,10 +134,10 @@ Verified against Docker 29.2.1 / Compose v5.0.2 on `linux/arm64`
 (Apple Silicon locally, Oracle Ampere A1 deployed). All three images are native
 arm64; there is deliberately no `platform:` key anywhere.
 
-### Run it
+### Run it locally
 
 ```bash
-git clone git@github.com:shreyasY2k/linkedin-profile-scrapper.git
+git clone https://github.com/shreyasY2k/linkedin-profile-scrapper.git
 cd linkedin-profile-scrapper
 
 cp .env.example .env       # then edit .env — see "Configuration" below
@@ -53,7 +161,7 @@ Every published port binds `127.0.0.1` only. Nothing on this stack answers on
 the host's public interface — in the deployed topology, host-installed nginx is
 the only thing that does.
 
-### Get a token
+### Get a token (locally)
 
 Everything under `/api/v1` requires a Keycloak bearer token. `/health` does not
 and never will — the container healthcheck has no token to present.
@@ -65,9 +173,10 @@ The realm, its confidential client and the audience mapper are all created by
 one `curl` with no redirect anywhere in it.
 
 Every block below is runnable **verbatim** from the repository root, against a
-stack that is already up. The first line loads `.env`, which is where your
-client secret, realm and issuer URL actually live; without it the commands post
-an empty secret and get a 401.
+**local** stack that is already up — the deployed equivalents, which depend on
+no local file at all, are at the top of this section. The first line loads
+`.env`, which is where your client secret, realm and issuer URL actually live;
+without it the commands post an empty secret and get a 401.
 
 ```bash
 set -a; . ./.env; set +a          # load KEYCLOAK_* from your .env
@@ -99,8 +208,9 @@ With the defaults in `.env.example` those expand to realm `linkedin`, client
 `linkedin-profile-api`, and a token endpoint at
 `http://127.0.0.1:8080/realms/linkedin/protocol/openid-connect/token`.
 
-**The graded lane is the `curl` above.** That is what CAP-3 is scored on and
-what the two commands in this README are for.
+**The graded lane is the public host, not this one.** The two commands at the
+top of this section are the ones the submission is scored on; these are their
+local twins.
 
 For local development there is also an **Authorize** button on
 <http://127.0.0.1:8000/docs>: give it `KEYCLOAK_CLIENT_ID` and
@@ -164,9 +274,10 @@ docker compose logs api | grep "Rejected request"
 # 2026-08-27 08:42:11,204 WARNING app.auth: Rejected request: InvalidAudienceError: Audience doesn't match
 ```
 
-Every error this API returns — 401, 404, 405, 422, 428, 500 — wears that same
-envelope. No response ever leaves in FastAPI's default `{"detail": "..."}`
-shape.
+Every error this API returns — 400, 401, 404, 405, 422, 428, 429, 500, 502, 503
+— wears that same envelope. No response ever leaves in FastAPI's default
+`{"detail": "..."}` shape. The full table is under
+[Fetch a profile](#fetch-a-profile).
 
 ### Store your LinkedIn session
 
@@ -254,8 +365,8 @@ on password change and on some security events. When that happens, repeat the
 
 ### Fetch a profile
 
-This is the second of the two copy-paste `curl` commands the submission is
-graded on. The first minted a token; this one uses it.
+The local twin of the second graded command. The `url` query parameter is the
+whole of the request; everything else about the endpoint is response shape.
 
 ```bash
 set -a; . ./.env; set +a
@@ -735,63 +846,280 @@ pre-commit install            # gitleaks now runs on every commit
 pre-commit run --all-files
 ```
 
+The working tree is the easy half. The **history** is the half that matters,
+because a secret removed in a later commit is still in the repository for ever:
+
+```bash
+docker run --rm -v "$PWD":/repo -w /repo zricethezav/gitleaks:latest \
+  git --config .gitleaks.toml --redact
+```
+
+`.gitleaks.toml` keeps gitleaks' default rule set in full and adds exactly three
+allowlist entries, each **anchored to one literal value** and none of them
+path-based:
+
+| Allowlisted value | Why it is not a leak |
+|---|---|
+| The `SESSION_ENCRYPTION_KEY` placeholder in `.env.example` | A valid Fernet key is 44 base64 characters, so the generic-api-key rule reads it as a credential. Base64-decode it and it says `change-me-generate-a-real-key!!!`. It has to be a *valid* key or `cp .env.example .env && docker compose up` would die on a clean clone |
+| The identifier `OptionalSecret` | A Python type-annotation name. `linkedin` followed by a 14–16 character token trips the `linkedin-client-id` rule, and the string is quoted in committed design notes where a rename cannot reach it |
+| The evaluator client secret | A **real** credential, published on purpose — see [About that client secret](#about-that-client-secret) |
+
+**Deliberately not by path.** A `paths` entry makes gitleaks skip a whole file
+before it reads a line of it, so a genuine secret pasted into `.env.example`
+would sail straight through — verified, and the reason there is not one. A
+one-string allowlist can only ever silence that one string.
+
 ---
 
 ## API documentation
 
-<!-- STORY 9: the generated OpenAPI document (http://127.0.0.1:8000/docs,
-     /openapi.json) is the API documentation. Include the two copy-paste curl
-     commands CAP-3 requires: one to mint a Keycloak token, one to call
-     GET /api/v1/profile with it. -->
+**The generated OpenAPI document is the API documentation**, and it is
+unauthenticated on the public host so it can be read before a token exists:
 
-_To be written by story 9._
+| | |
+|---|---|
+| **Swagger UI** | <https://shreyaskaushik.dpdns.org/docs> |
+| **ReDoc** | <https://shreyaskaushik.dpdns.org/redoc> |
+| **OpenAPI 3.1 JSON** | <https://shreyaskaushik.dpdns.org/openapi.json> |
 
-## Approach
+It is generated from the same Pydantic models the endpoints return, so it cannot
+drift from the implementation the way a hand-written table can. Locally the same
+three URLs live under `http://127.0.0.1:8000`.
 
-<!-- STORY 9 -->
+```bash
+curl -sS https://shreyaskaushik.dpdns.org/openapi.json \
+  | python3 -c "import sys,json;print(sorted(json.load(sys.stdin)['paths']))"
+# ['/api/v1/profile', '/api/v1/session', '/health']
+```
 
-_To be written by story 9._
+### The four routes
 
-## Known limitations
+| Route | What it does | Auth |
+|---|---|---|
+| `GET /api/v1/profile?url=…` | **The graded endpoint.** Takes a LinkedIn profile URL as the `url` query parameter, returns the profile as structured JSON. Six live calls to LinkedIn per request, or the last good record if a retryable failure gets in the way | Bearer |
+| `PUT /api/v1/session` | Store or replace your `li_at`. Body `{"li_at": "..."}`. Encrypted at rest, bound to your token's `sub`, verified once against LinkedIn's `me` endpoint on the way in. Overwrite is the entire lifecycle — there is no delete | Bearer |
+| `GET /api/v1/session` | Whether you have a session stored, when, and whether its last use worked. **Never returns the cookie**, under any flag | Bearer |
+| `GET /health` | Liveness. `{"status":"ok"}`. Checks no dependencies, by design — it is what the container healthcheck and the load-balancer probe call, and neither has a token | None |
 
-<!-- STORY 9: name the specific failure modes from the brief addendum —
-     session expiry, challenge pages, datacenter-IP reputation, unversioned
-     Voyager endpoints, unbounded stale-serve — not generic caveats.
+Anything else under `/api/v1` answers `401`, whether or not the path exists.
 
-     Story 7 verified three that belong here verbatim; all three are written up
-     under "When LinkedIn will not answer" and recorded in
-     _bmad-output/implementation-artifacts/deferred-work.md:
+### Authentication
 
-     1. A dead li_at whose authwall arrives as a 200 classifies as
-        UPSTREAM_CHALLENGE (retryable) and IS stale-served indefinitely, so the
-        "SESSION_EXPIRED is never a stale 200" guarantee has a real gap.
-        Verified live, not theorised. Story 8 narrowed it as far as the evidence
-        allows: the same wall on the `me` endpoint, which describes the
-        session's own owner, IS read as expiry, so PUT /api/v1/session tells the
-        caller their cookie is dead at the moment they store it. On a profile
-        fetch the two pages remain indistinguishable and the gap stands.
-     2. The response cache is keyed by profile and shared across callers, while
-        LinkedIn's retrieval is viewer-relative — so a stale answer can be a
-        richer view than the requesting caller's own session would produce.
-        Accepted for a single-evaluator service; not acceptable multi-tenant.
-     3. Media URLs in a stale record are signed and expire, so an old record's
-        images 403. Deliberately not stripped — see the README section.
+One scheme, `KeycloakClientCredentials`, declared in the OpenAPI document as an
+OAuth2 `clientCredentials` flow with its `tokenUrl` pointing at the realm:
 
-     Story 8 adds one that MUST be stated here, because it is a deliberate,
-     human-approved deviation from a published contract rather than a caveat:
+```
+https://shreyaskaushik.dpdns.org/realms/linkedin/protocol/openid-connect/token
+```
 
-     4. `retryable` is a property of the RESPONSE, not of the code.
-        response-schema.md's table marks UPSTREAM_ERROR retryable; a response
-        naming a different member than the URL asked for returns that code with
-        `retryable: false`. The wire value is authoritative over the table for
-        this one case, and a client must branch on the flag rather than on the
-        code. A new taxonomy row was the declined alternative. -->
+Tokens are validated against the realm's JWKS, with `iss` and `aud` checked by
+exact equality. Access tokens live 900 s. Swagger UI's **Authorize** button
+drives the same flow — see the caution under
+[Get a token (locally)](#get-a-token-locally) before typing a deployed secret
+into a browser.
 
-_To be written by story 9._
+### The success envelope
+
+`GET /api/v1/profile` returns `ProfileEnvelope`. The profile itself is nested
+inside a wrapper that carries the provenance, and reading the wrapper first is
+the point:
+
+```json
+{
+  "url":        "the URL you asked for",
+  "public_id":  "the /in/{public-id} it resolved to",
+  "stale":      false,
+  "fetched_at": "2026-08-27T09:00:00Z",
+  "partial":    [],
+  "profile":    { "name": {...}, "headline": "...", "location": {...},
+                  "about": "...", "experience": [...], "education": [...],
+                  "skills": [...], "certifications": [...],
+                  "languages": [...], "images": {...} }
+}
+```
+
+- **`stale`** — `false` if `profile` was read from LinkedIn during this request,
+  `true` if the live call failed and a stored record was served instead. There
+  is no third value.
+- **`fetched_at`** — when the returned profile was read from LinkedIn, never
+  when the response was served. Nothing re-stamps it.
+- **`partial`** — always present, `[]` on a complete answer. It carries the
+  absent-versus-unreadable distinction that the whole schema is built around: a
+  key that is **present** is a positive claim, a key that is **omitted** and
+  named here means "we could not read it and are not going to guess". Full
+  treatment, including dotted sub-field names, under
+  [Fetch a profile](#fetch-a-profile).
+
+`PUT`/`GET /api/v1/session` return `SessionResponse`:
+`{"stored": bool, "stored_at": ..., "last_used_at": ..., "last_use_ok": bool|null}`.
+
+Every response, success included, carries `Cache-Control: no-store`. These
+bodies are specific to the caller, and a shared cache in front of the service
+keys on nothing that distinguishes one from another.
+
+### The error envelope
+
+**Every non-2xx response wears the same shape.** Nothing ever leaves in
+FastAPI's default `{"detail": "..."}`, and nothing ever returns a naked 500 or a
+stack trace:
+
+```json
+{"error": {"code": "SESSION_EXPIRED",
+           "message": "LinkedIn refused the stored session.",
+           "retryable": false}}
+```
+
+`code` is a stable machine-readable string; `message` is for a human;
+`retryable` says whether repeating the request could plausibly succeed.
+
+**Branch on `retryable`, not on the code.** It is a property of the *response*,
+not of the code — there is one condition where the same code carries the
+opposite flag, and it is documented in
+[Known limitations](#retryable-on-the-wire-outranks-the-documented-table).
+
+The full status/code table is under [Fetch a profile](#fetch-a-profile). In
+summary: `400 INVALID_URL`, `401 UNAUTHENTICATED`, `404 PROFILE_NOT_FOUND`,
+`405 METHOD_NOT_ALLOWED`, `422 INVALID_REQUEST`, `428 NO_SESSION` /
+`428 SESSION_EXPIRED`, `429 RATE_LIMITED`, `502 UPSTREAM_CHALLENGE` /
+`502 UPSTREAM_ERROR`, `503 SERVICE_UNAVAILABLE`, `500 INTERNAL_ERROR`.
 
 ---
 
-## Repository layout
+## Approach
+
+### The shape of the problem
+
+LinkedIn publishes no public profile API. The data an assignment like this asks
+for — name, headline, location, about, experience, education, skills,
+certifications, languages, images — exists only behind an authenticated session,
+and the environment is actively adversarial: authwalls, challenge pages,
+datacenter-IP reputation, and an internal API that is unversioned and can change
+without notice. So the interesting decisions are not about parsing. They are
+about **whose credential is spent, what happens when the answer does not come,
+and how the response tells the truth about what it could not read.**
+
+### Credential model — bring your own session
+
+The obvious design, and the one the assignment's own wording suggests, is a
+single LinkedIn account held in the backend. It was rejected: it concentrates
+every rate limit and every security challenge onto one account, so **one lockout
+takes the whole service down** during exactly the window it is being graded in.
+A pool of rotated accounts is the throughput answer and was rejected as
+unbuildable in the time available — cold accounts trip security checks quickly.
+
+What shipped is **per-caller BYO session**: you `PUT` your own `li_at` once, it
+is encrypted with Fernet, bound to your token's `sub`, and every fetch you make
+runs under it. Exposure is distributed across callers rather than pooled on one
+account, and each request is made under the requester's own authenticated
+session rather than a shared harvesting account. The costs are real and were
+accepted: encrypted per-user secret storage, an upload flow, and a revocation
+story that is thinner than it should be (see
+[Known limitations](#there-is-no-way-to-delete-a-stored-session)).
+
+The subject is encrypted **inside** the ciphertext, not merely stored in a
+column beside it. Fernet has no associated-data parameter, so its tag proves
+"written with the key", not "written for this row" — without the binding,
+anyone who could write the table but not read the key could move caller A's
+session into caller B's row and B would silently run under A's LinkedIn
+identity.
+
+**The evaluator lane bends this deliberately.** The `linkedin-profile-api`
+client's vault row is pre-seeded so the two graded commands work from a machine
+that has never authenticated. That means evaluator traffic runs under the
+author's own session — concentrating precisely the exposure this model was
+chosen to avoid. It is a knowing trade for a literal reading of the grading
+criterion, and it is the first entry under
+[Known limitations](#the-evaluator-lane-runs-under-the-authors-own-linkedin-session).
+
+### Retrieval — Voyager JSON, and no browser
+
+Three options were on the table:
+
+| Option | Verdict |
+|---|---|
+| Public HTML, logged out | **Rejected.** No credential risk at all, but LinkedIn serves authwalls to most datacenter IP ranges and truncates what remains. It would fail the field-coverage requirement outright |
+| Headless browser as the primary path | **Rejected as primary.** More resilient to API shape changes, but 400–700 MB of Chromium per request, slow, and `arm64` support needed verifying on the one instance that exists |
+| **Voyager JSON (chosen)** | LinkedIn's own internal API returns structured JSON directly. It is the literal task, and it is one HTTP client with no rendering engine |
+
+The browser path was written into the plan as a **fallback** and then demoted
+from Must to Could once the RAM arithmetic was laid out. **It was never built,
+and there is no Playwright, Selenium or Chromium anywhere in this repository** —
+`requirements.txt` is seven packages and none of them renders a page. Saying so
+plainly is better than leaving a reader to infer a fallback that does not exist.
+
+One fetch is **six** calls: one for the core profile, then five concurrent
+section calls (experience, education, skills, certifications, languages). There
+is no retry, because the failures worth retrying are the ones an immediate retry
+makes worse. Sections are requested with `count=100` rather than the default 20
+— found the hard way, when a profile with 33 skills returned 20 of them with a
+`200` and no error. Beyond 100 the shortfall is **reported** rather than
+silently truncated: the section is omitted and named in `partial`.
+
+The client is the only place in the codebase that puts a LinkedIn session on the
+wire, calls `linkedin.com`, or knows the endpoint map. It refuses to follow a
+redirect off `linkedin.com` while carrying the cookie — verified, because the
+naive version forwards a manually-set `Cookie` header across hosts.
+
+### Staleness — answer, or explain why not
+
+LinkedIn will refuse sometimes, and an evaluation service that returns `502` at
+that moment has failed at the only thing it does. So every successful answer is
+stored, and when a live retrieval fails **for a reason retrying could fix**, the
+last good record is returned instead, with `stale: true` and the original
+`fetched_at`.
+
+Three properties make that honest rather than a lie of convenience:
+
+1. **Only retryable failures fall back.** A permanent failure reaches you as
+   itself, however good the cached copy is. A dead session is `428`, not a
+   comfortable `200`.
+2. **The record is served exactly as stored.** Same `profile`, same `partial`,
+   same omitted keys — nothing is re-derived on the way out, so "this was true
+   once, at this timestamp" is a checkable claim.
+3. **It is unbounded, and that is the trade.** No TTL, no eviction, no delete
+   endpoint. An answer you can date and judge beats an error page. `fetched_at`
+   is what makes it actionable, and refusing any response with `stale: true` is
+   a one-line client-side check.
+
+The rejected alternative was a TTL. It would have converted "old but dated
+answer" into "error", which is the failure this design exists to avoid.
+
+### Evaluator access — Keycloak service accounts
+
+Leaving the service fully open is the most literal reading of "deploy publicly"
+and was rejected: any traffic that finds the URL burns real LinkedIn quota
+against somebody's real account. Google SSO alone was rejected as the sole lane
+because it is not scriptable — an evaluator who hits a browser redirect may
+simply record the endpoint as unreachable.
+
+**Keycloak `client_credentials`** is what shipped: two `curl` commands, no
+browser, standard OAuth2, and the realm is created from a committed export
+(`deploy/keycloak/realm-linkedin.json`) on container start, so there is no
+console step to remember. The export carries `${KEYCLOAK_CLIENT_SECRET}`
+placeholders substituted at import, and is secret-free by construction.
+
+The realm ships **two** confidential clients on purpose. One
+`client_credentials` client is one service-account user and therefore one `sub`
+— per-caller isolation was real in the code and undemonstrable in the
+deployment. The second client is a second subject and nothing else.
+
+### Deployment
+
+Cloudflare (proxied) → OCI load balancer, which terminates TLS and holds the
+certificate → host nginx on port 80 → the compose stack on loopback. The
+instance has no public IP; its only inbound path is the load balancer, and
+nginx is the only process on it that answers off-loopback. Application
+containers bind `127.0.0.1` exclusively.
+
+The whole application is one `docker compose up`, identical image locally and
+deployed — only `.env` differs, and there is no `APP_ENV` or any code path that
+branches on an environment name. Full runbook, including the traps that cost
+real time (Oracle's host `iptables` dropping port 80 independently of the
+Security List; the load-balancer health check needing a route that actually
+exists), is in [`deploy/README.md`](deploy/README.md). Diagrams are in
+[`docs/architecture.md`](docs/architecture.md).
+
+### Repository layout
 
 ```
 app/
@@ -845,14 +1173,342 @@ tests/
   test_linkedin_live.py    the one opt-in live check; skipped by default
   fixtures/          synthetic Voyager payloads — invented people, .invalid
                      hosts, no captured data (a test enforces this)
-.gitleaks.toml       secret-scan config: the default rules, plus two
-                     value-anchored allowlists for known non-secrets
+.gitleaks.toml       secret-scan config: the default rules, plus three
+                     value-anchored allowlists — two known non-secrets and the
+                     deliberately published evaluator client secret
 deploy/
-  keycloak/          the committed realm export, imported on container start
-  nginx/             the deployed site config (story 2)
+  README.md          the deployment runbook: topology, the Oracle firewall trap,
+                     the redeploy recipe, and how to re-export the realm safely
+  keycloak/          the committed realm export, imported on container start,
+                     with ${...} placeholders where the client secrets go
+  nginx/             the deployed site config — port 80 only, no certificate
+  open-ports.sh      the host-iptables step, insert-only and non-persisting
+docs/
+  architecture.md    diagrams: topology, request flow, retrieval fan-out,
+                     the auth boundary, and the decision log
 Dockerfile           slim python base, non-root, deps layer before source
 docker-compose.yml   api + keycloak + postgres, healthchecked, loopback-only
 .env.example         the env contract
 ```
+
+---
+
+## Known limitations
+
+Written candidly and at length, because the honest failure modes of a service
+like this are more informative than a list of features. Every item below is
+either **observed** against the running system or a **deliberate decision** —
+where it is a decision, it says so and says why.
+
+### Automated collection is contrary to LinkedIn's User Agreement
+
+Stated plainly and not softened, because it is the first thing an operator of
+this service needs to know.
+
+**Automated collection of profile data is contrary to LinkedIn's User Agreement,
+irrespective of whose session is used.** The per-user credential model narrows
+the question — each request is made under the requester's own authenticated
+session rather than a shared harvesting account, so nobody's data is being
+gathered under a credential they did not supply — but it **does not resolve it**.
+Using this service against your own account carries the ordinary consequences
+LinkedIn applies to automated access: challenges, throttling, and account
+restriction up to and including permanent suspension.
+
+Nor is the User Agreement the only frame. Profile data is personal data, and
+collecting or storing it engages data-protection law wherever the subject is —
+this service caches full profiles indefinitely with no subject-access, deletion,
+or lawful-basis story of any kind.
+
+**This system is built for the evaluation of a coding assignment, not for
+production operation, and it should not be pointed at anything that matters.**
+The assignment's request for known limitations is read here as an invitation to
+show that the environment is understood, so the position is stated rather than
+minimised.
+
+### The evaluator lane runs under the author's own LinkedIn session
+
+The two graded commands work from a cold machine because the
+`linkedin-profile-api` client's vault row is **pre-seeded with the author's own
+`li_at`**. Every consequence of that is real:
+
+- Evaluator traffic spends the author's LinkedIn quota and accumulates against
+  the author's account — concentrating exactly the rate-limit and
+  terms-of-service exposure the BYO model was chosen to distribute.
+- If that account is challenged or locked during grading, the graded lane
+  returns `502 UPSTREAM_CHALLENGE`, or a stale `200` if the profile was fetched
+  before.
+- Anyone holding the published client secret can spend that quota.
+
+It is a deliberate, author-approved trade for the criterion being graded — two
+commands, verbatim, no prior authentication — and not an oversight. `PUT`ting
+your own cookie (the third command in [Setup](#setup)) moves you off it.
+
+### The published evaluator client secret
+
+Restating it here because it belongs in any honest limitations list: a **real
+working credential is committed to this repository**, deliberately, so the
+graded commands run verbatim. It reaches only this evaluation service and grants
+nothing beyond the three routes — but it is permanent in the git history once
+published, and anyone who finds it can call the API and spend the LinkedIn quota
+described above. **It should be rotated after grading.** Full reasoning under
+[About that client secret](#about-that-client-secret).
+
+### A dead cookie can be reported as staleness rather than expiry
+
+**Verified against the running stack, not theorised.** LinkedIn does not always
+state a refusal as a refusal: a dead `li_at` is sometimes answered with a
+redirect to an authwall carrying a `200`, and that is the *same page* a
+datacenter IP draws with a perfectly healthy session. On a profile fetch this
+service genuinely cannot tell them apart, so it classifies both as
+`502 UPSTREAM_CHALLENGE` — which is retryable — which means that particular kind
+of dead session **is** stale-served, indefinitely, and the caller is never told
+to store a new cookie.
+
+The gap is narrower than it was, but it is not closed. `PUT /api/v1/session`
+verifies the cookie against LinkedIn's `me` endpoint, which describes the
+session's own owner; a wall in reply to *that* question is evidence about the
+cookie and nothing else, so it is read as expiry and the `PUT` answers
+`last_use_ok: false` immediately. On a profile fetch the two pages remain
+indistinguishable. **Practical consequence: if `stale` has been `true` for
+longer than you can explain, re-`PUT` your session.**
+
+The converse is evidenced in one direction only. Nothing establishes that
+LinkedIn never walls `me` for a *healthy* session from a datacenter IP; if it
+does, `PUT` reports `last_use_ok: false` about a credential that works. The
+blast radius is bounded — `me` is reached only by the `PUT` verification, never
+by the profile route — so a wrong verdict costs a misleading bookkeeping field
+rather than a failed fetch.
+
+### The cache is keyed by profile; LinkedIn's retrieval is viewer-relative
+
+A record fetched under one caller's session answers another caller's request for
+the same profile. Access is controlled — the session check happens *before* the
+cache is consulted, so nobody without a working session of their own can reach
+it — but **content is not**. LinkedIn's profile responses depend on the viewer:
+connection degree, and whatever privacy settings the member applies to people
+outside it, change what comes back. So a stale answer can be a **richer** view
+than the requesting caller's own session would ever have retrieved live.
+
+Accepted knowingly for a single-evaluator service. It would not be acceptable
+multi-tenant, where the cache key would have to include the viewer — which also
+multiplies the LinkedIn call cost by the number of callers, so it is a real
+design change and not a one-line fix.
+
+### Stale records carry image URLs that have expired
+
+The `images` URLs LinkedIn returns are **signed and time-limited** — a live
+fetch returns things like `…?e=1789603200&v=beta&t=…`. Because stale-serve is
+unbounded, a record served long after it was fetched carries URLs that `403`.
+
+They are deliberately **not** stripped. Removing them would mean re-shaping the
+record on the way out, which is exactly what "served exactly as it was stored"
+forbids; and a missing `images` key would say "this member has no photo" — a
+claim about the member, when the truth is a fact about a URL. `fetched_at` tells
+you how likely it still resolves. The honest fix, if this ever mattered, is a
+media-proxy endpoint that re-signs on demand, not a mutation of the stored
+record.
+
+### The cache grows without bound and nothing can remove one record
+
+No TTL, no eviction, no delete endpoint — `ProfileCacheStore` deliberately
+exposes no delete so it cannot be reintroduced by accident. The table grows by
+roughly 7 KB per distinct profile ever fetched. **The only way to drop a record
+is `docker compose down -v`, which also destroys the Keycloak realm and every
+stored session.**
+
+Two consequences worth naming: there is no way to honour a deletion request for
+a cached profile short of dropping everything, and a profile whose owner has
+since made it private keeps being republished from cache. Do not add a TTL
+without renegotiating the design — the entire stale-serve argument rests on its
+absence.
+
+### There is no way to delete a stored session
+
+`PUT` overwrite is the whole lifecycle. The remedy for "my cookie leaked" is
+"supply a second valid cookie", which is not the same thing as revocation.
+
+Bounded rather than fixed: the stored value is unreadable without
+`SESSION_ENCRYPTION_KEY`, is returned by no endpoint under any flag, and
+revoking at LinkedIn's end ("log out of all sessions") invalidates the cookie
+whatever this vault holds. The shape that would close it is
+`DELETE /api/v1/session` keyed on the verified `sub`.
+
+### A revoked token stays accepted for up to 900 seconds
+
+Token validation is stateless JWT verification against the realm's JWKS, with no
+introspection call. So a rotated client secret or a disabled service account
+does not take effect until the outstanding access token expires — **up to 900 s**.
+Inherent to the design, acceptable for an evaluation service, and worth knowing
+before rotating the published secret and assuming it took effect immediately.
+
+Related: `require_claims` **authenticates but does not authorise**. Beyond issuer
+and audience there is no `azp`, scope or role check, so any other realm client
+carrying an audience mapper aimed at `linkedin-profile-api` would get full
+access. Deliberate — a Should-tier Google SSO lane would mint user tokens with a
+different `azp` — but it is one realm-configuration mistake away from mattering.
+
+### The committed encryption-key placeholder is a valid key
+
+`SESSION_ENCRYPTION_KEY` in `.env.example` is a **real, valid Fernet key** that
+base64-decodes to `change-me-generate-a-real-key!!!`. It has to be valid, or
+`cp .env.example .env && docker compose up` would die on a clean clone — which
+is an acceptance criterion. **A deployment that never replaces it therefore
+encrypts every stored cookie under a key printed in a public repository.**
+
+The stricter alternative — refuse to boot on the placeholder — was considered
+and rejected for that reason. It is mitigated by loudness rather than fatality:
+the API logs `CRITICAL` on every start when the configured key is the shipped
+placeholder. Tests pin both that it still boots and that it shouts. The change
+is one line if this service ever outlives the evaluation.
+
+### Rotating the encryption key silently orphans every stored session
+
+There is no re-encryption path. Rows written under an old
+`SESSION_ENCRYPTION_KEY` cannot be decrypted, and they surface as
+`428 SESSION_EXPIRED` — the same code a genuinely dead cookie produces. The real
+reason is in the API log; the caller sees only "store a new one". Key rotation
+is an ordinary operational act with a non-obvious consequence here, and the
+remedy is one `PUT` per caller.
+
+### `retryable` on the wire outranks the documented table
+
+A deliberate, approved deviation from a published contract, called out because a
+client that trusts the table will get this wrong.
+
+`retryable` is a property of the **response**, not of the code.
+`response-schema.md` marks `UPSTREAM_ERROR` retryable — and it is, everywhere
+except one case: a fetch that comes back naming a **different member** than the
+URL asked for returns `502 UPSTREAM_ERROR` with `"retryable": false`, because
+that condition is permanent and repeating the request cannot change it. The wire
+value is authoritative over the table for that case. Adding a new taxonomy row
+was the declined alternative. **Branch on the flag, not on the code.**
+
+### Route existence is partially observable without a token
+
+`/api/v1` paths answer `401` whether or not they exist, which closes the obvious
+enumeration channel — but **enumeration resistance is not a property this
+service claims**, and two things leak:
+
+- `/openapi.json` is unauthenticated and publishes every route, by design,
+  because it is this API's documentation.
+- FastAPI reads and parses a request body *before* route dependencies run, so
+  `PUT /api/v1/session` with malformed bytes returns `400` while the same
+  malformed request to a non-existent path returns `401`.
+
+Closing the second means moving authentication into middleware ahead of body
+parsing — a larger change than the leak justifies given the first. Accepted, and
+stated rather than implied.
+
+Related: because the unmatched-path guard matches every method, an `OPTIONS`
+preflight to any `/api/v1` path is answered `401` before anything CORS-aware
+runs. Nothing is broken today — there is no CORS middleware and no browser
+client — but whoever adds a browser lane must install `CORSMiddleware` ahead of
+the router rather than carving an exception into the guard.
+
+### The Voyager endpoint map is undocumented, unversioned, and verified against one profile
+
+LinkedIn's internal API is not a published interface. It can change without
+notice, and the endpoint most third-party documentation still names is already
+`410 Gone`. One opt-in test (`tests/test_linkedin_live.py`, skipped by default,
+two gates to run) is the only assertion that can catch a shape change, and it
+fetches **only the profile the session itself owns** — so per-profile shape
+variation is untested. A profile with no certifications, a hidden headline, or a
+non-`en_US` primary locale may carry shapes no fixture mirrors. The mapper
+treats every field as optional for exactly this reason, but "degrades into
+`partial[]`" is the best guarantee available, not "works".
+
+Measured, and worth knowing: `profileLanguages` returned **0 elements** on one
+call and **3** on an identical call minutes later, HTTP 200 both times. A
+zero-length section is therefore not evidence that the member lacks that data,
+which is why empty sections can land in `partial[]` rather than being published
+as `[]`.
+
+### Sections beyond 100 entries are reported, not retrieved
+
+Each section is requested with `count=100` in a single call. Beyond that the
+shortfall is **visible rather than fixed**: the section is omitted from
+`profile` and named in `partial`. Following further pages would multiply the
+per-request call count against LinkedIn and was not done.
+
+The truncation signal is also slightly conservative: a section returning exactly
+100 elements with no `paging.total` is reported as possibly truncated, which
+will occasionally be a false positive. The two errors are not symmetric — a
+false positive costs a caller an unnecessary caveat, a false negative publishes
+a partial career as a complete one.
+
+### A whole section is discarded for one unreadable entry
+
+A single element that cannot be mapped onto the contract shape sends its
+**entire** section to `partial[]`, discarding the entries that mapped fine.
+Deliberate, and the same argument as truncation: dropping the bad entry silently
+would shorten somebody's career without saying so, and the envelope has exactly
+two states for a field — present-and-complete, or omitted-and-named. There is no
+way to say "here are four of five roles" in the current contract. Reached only
+by a non-object element, or by a skills entry with no readable name.
+
+Similarly, `images.profile` and `images.background` conflate **absent** and
+**unreadable**: a picture that exists but whose `vectorImage` cannot be joined
+into a URL is `null`, the same as a member with no picture, and `images` never
+reaches `partial[]`. Fixing it properly means `partial` accepting dotted paths
+for nested scalars, which is a contract change.
+
+### `employment_type` is never resolved
+
+You will see `experience.employment_type` in `partial` on most real profiles.
+LinkedIn references an employment type on each position
+(`urn:li:fsd_employmentType:12`) and delivers nothing that names it. Publishing
+the URN in a field a consumer would read as "Full-time" is an unreadable value
+dressed as a readable one, and decoding it from a remembered lookup table would
+be this service guessing at a label for somebody's job. So it is omitted and
+reported. This is correct behaviour rather than a defect, but it is a field the
+assignment's consumer might expect to be populated.
+
+### A changed vanity URL is refused rather than resolved
+
+If the profile returned does not carry the `public-id` that was asked for, the
+request fails with `502` — and **not** from cache, even when a record exists.
+Fail-closed on purpose: serving one person's profile under another's URL, then
+caching it unboundedly, is the worst failure available here.
+
+The cost is untested and real. It is unknown whether LinkedIn's `memberIdentity`
+lookup resolves an old vanity name to the current profile; if it does, a
+legitimate old URL becomes a hard failure. Refusing is recoverable by the caller;
+answering with the wrong person is not.
+
+### Operational gaps
+
+None of these bite an evaluation. All of them would bite anything longer-lived.
+
+- **No migration tool.** The schema is created by an idempotent
+  `CREATE ... IF NOT EXISTS` bootstrap on every boot, so there is no migration
+  history and no down-path. Adding a **column** to an existing table is a trap:
+  the DDL is a no-op on a warm volume and every statement naming the column then
+  fails — and on the cache path that failure is swallowed by design, so it would
+  ship as a silently dead cache. Until a tool exists, a new column needs an
+  accompanying `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`.
+- **One instance, no redundancy.** A single Oracle Ampere A1 VM. No autoscaling,
+  no failover, no backups of the Postgres volume. Hosting was reaffirmed as
+  Oracle-only after non-Oracle alternatives were raised, as a deliberate
+  accepted risk.
+- **No rate limiting.** Nothing throttles a caller, so a holder of the published
+  secret can spend LinkedIn quota as fast as the upstream allows.
+- **The API shares Postgres with Keycloak as the same superuser.** Application
+  tables live in an `app` schema and Keycloak owns `public`, so they cannot
+  collide over a name — but a bug in the API can reach Keycloak's identity
+  tables. A least-privilege role is the fix.
+- **No CI.** `pre-commit` and the test suite are opt-in local installs a
+  contributor can skip; nothing enforces gitleaks or the tests on push. Every
+  verification in this README was run by hand.
+- **Every rejected request logs at `WARNING`**, so an unauthenticated flood is
+  also a log flood, and there is no log rotation configured for the `api` or
+  `postgres` containers.
+- **Timeouts are a backstop, not a budget.** Each of the six calls has a 15 s
+  timeout and the whole fetch a 45 s deadline — set deliberately *above* the
+  worst legitimate case so it never kills a merely-slow fetch. A healthy-but-slow
+  request can therefore hold a connection open for ~30 s. `asyncio.timeout` also
+  cannot cancel work already inside `asyncio.to_thread`, so the thread runs to
+  completion even after the request is abandoned.
+
+---
 
 Built for a graded evaluation, not for production operation.

@@ -156,12 +156,12 @@ Auth attaches to the **router**, not to individual routes, so a later route inhe
 | 1 | Skeleton, env config, local parity | Done |
 | 2 | Deploy through LB and nginx | **Done** — live at https://shreyaskaushik.dpdns.org |
 | 3 | Keycloak realm, clients, JWT validation | Done |
-| 4 | Voyager client, raw JSON | In progress |
+| 4 | Voyager client, raw JSON | Done — six calls per fetch, `count=100` sections, truncation reported rather than hidden |
 | 5 | Encrypted per-user session vault | Done — `PUT`/`GET /api/v1/session`, Fernet at rest, keyed on `sub` |
-| 6 | Profile extraction and schema mapping | Pending — the graded core |
-| 7 | Response cache with stale-serve | Pending |
-| 8 | Error taxonomy and handlers | Pending |
-| 9 | README, secret audit, final deploy | Pending |
+| 6 | Profile extraction and schema mapping | Done — the graded core; `partial[]` carries absent-versus-unreadable |
+| 7 | Response cache with stale-serve | Done — Postgres-backed, unbounded, retryable failures only |
+| 8 | Error taxonomy and handlers | Done — every response wears `ErrorEnvelope`; unmatched `/api/v1` paths answer 401 |
+| 9 | README, secret audit, final deploy | Done — four required README sections, history audited, deployed instance matches HEAD |
 
 ## Decisions worth knowing
 

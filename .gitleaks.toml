@@ -1,10 +1,13 @@
 # gitleaks configuration. Picked up automatically by the pre-commit hook in
 # `.pre-commit-config.yaml` and by `gitleaks git`/`gitleaks dir` run by hand.
 #
-# The default rule set is kept in full. The only thing added is one narrow
-# allowlist, and it is narrow on purpose: an allowlist that silenced a whole
+# The default rule set is kept in full. The only things added are three narrow
+# allowlists, and each is narrow on purpose: an allowlist that silenced a whole
 # file, or a whole rule, would turn the secret scan into decoration — which is
-# the one thing story 9's history audit cannot afford.
+# the one thing the history audit cannot afford.
+#
+# Every entry below is anchored to ONE LITERAL VALUE. None of them is a `paths`
+# entry, and none of them should ever become one.
 
 [extend]
 useDefault = true
@@ -47,3 +50,27 @@ Matched by the literal identifier and anchored, so it silences that one word and
 nothing that merely contains it.
 """
 regexes = ['''^OptionalSecret$''']
+
+[[allowlists]]
+description = """
+The evaluator's Keycloak client secret. This one IS a real credential, and it is
+in the repository on purpose.
+
+The assignment is graded on two copy-paste curl commands running verbatim from a
+machine that has never authenticated. A placeholder cannot satisfy that, so the
+author approved publishing this one value literally. It is a client_credentials
+secret for the confidential client `linkedin-profile-api` in the `linkedin`
+realm on one host; it reaches only this evaluation service, unlocks no other
+system, and grants nothing beyond the three /api/v1 routes. README.md says all
+of this in the open, including that it is permanent in the history once pushed
+and should be rotated after grading.
+
+It is allowlisted so that the history audit reports zero leaks and therefore
+still MEANS something. Suppressing it silently, or reaching for a `paths` skip
+over .env.example or README.md, would have hidden the next real secret too.
+
+Matched by the LITERAL VALUE and anchored, exactly like the two entries above.
+Rotating the secret must be accompanied by deleting this entry — a stale
+allowlist for a dead credential is one more string the scanner cannot see.
+"""
+regexes = ['''^REPLACE_WITH_EVALUATOR_CLIENT_SECRET$''']

@@ -4,9 +4,10 @@ Everything outside `docker-compose.yml` that has to exist on the instance for
 `https://shreyaskaushik.dpdns.org/health` to answer.
 
 The application stack itself — API, Keycloak, Postgres — is entirely inside
-`docker-compose.yml` and needs nothing here. Only Docker, nginx, the host
-firewall and the TLS material are configured outside compose, which is what
-makes the nginx site config the sole deployment-time wiring step.
+`docker-compose.yml` and needs nothing here. Only Docker, nginx and the host
+firewall are configured outside compose, which is what makes the nginx site
+config the sole deployment-time wiring step. **No TLS material is installed on
+this instance** — see below.
 
 ---
 
@@ -14,10 +15,11 @@ makes the nginx site config the sole deployment-time wiring step.
 
 ```
 client
-  → Cloudflare        DNS for shreyaskaushik.dpdns.org, proxied, Full (strict)
-    → OCI Load Balancer                     the only public path to the instance
-      → instance 10.0.1.173:80 / :443       host nginx, the only public listener
-        → 127.0.0.1:8000                    the api container
+  → Cloudflare        DNS for shreyaskaushik.dpdns.org, proxied
+    → OCI Load Balancer      HTTPS listener :443 — TLS terminates HERE
+      → instance 10.0.1.173:80        host nginx, the only public listener,
+        → 127.0.0.1:8000              no certificate      the api container
+        → 127.0.0.1:8080              keycloak (location /realms/ only)
 ```
 
 The instance has **no public IP**. Its only inbound path is the load balancer;
@@ -25,30 +27,54 @@ its egress is a NAT gateway (`129.154.237.13`). Application containers keep the
 loopback-only bindings they were given in `docker-compose.yml` — nothing but
 nginx answers off-loopback.
 
-**TLS terminates at nginx**, on a Cloudflare Origin Certificate, with Cloudflare
-set to Full (strict). This resolves the SPEC's open question. It was chosen over
-Cloudflare Flexible because Flexible leaves the Cloudflare→origin hop in
-plaintext and this service carries `li_at` cookies and bearer tokens; and over
-Let's Encrypt because an Origin Certificate is free, lasts 15 years, and needs
-no ACME client or renewal timer on a host nobody watches after submission.
-**There is deliberately no certbot on this instance.**
+**TLS terminates at the OCI load balancer**, which holds the certificate.
+An earlier draft of this runbook planned termination at nginx on a Cloudflare
+Origin Certificate; that was abandoned during the story-2 deploy (commits
+`d306ad8`, `2135ea9`) and this file has been corrected to match what runs.
+Concretely, and verified on the running host:
+
+- nginx `listen 80` only, no `ssl` directive, no certificate paths —
+  `deploy/nginx/linkedin-profile-api.conf`.
+- Host `iptables` accepts 80 and **not** 443. Nothing on this box ever speaks
+  TLS, so there is nothing for 443 to reach.
+- **There is deliberately no certbot and no Origin Certificate on this
+  instance.** There is no certificate to install, renew, or lose.
+
+The one plaintext hop is load balancer → instance, inside the OCI VCN, never
+across the public internet.
+
+nginx must **not** `return 301 https://…`. It is handed `http` on requests the
+client made over HTTPS, so a scheme-based redirect loops for ever. The
+`http://` → `https://` upgrade belongs at the Cloudflare edge.
+
+> **Known gap, stated rather than implied.** Cloudflare "Always Use HTTPS" is
+> **not** currently switched on for this zone, and the load balancer has no
+> port-80 listener, so `http://shreyaskaushik.dpdns.org/health` answers
+> Cloudflare **522** rather than a 301. `https://` answers `200`. Every command
+> in the README uses `https://`, so nothing graded depends on it; turning
+> "Always Use HTTPS" on in the Cloudflare dashboard is the one-click fix and is
+> what the nginx config's comments assume.
 
 ---
 
 ## The Oracle trap — read this before anything else
 
-Opening 80/443 in the **OCI Security List is not sufficient.** The stock Ubuntu
-image drops those ports in host `iptables` independently. Open one layer and
-leave the other shut and you get the worst possible symptom: the load balancer
-marks the backend unhealthy while every setting in the OCI console reads
-correct.
+Opening the port in the **OCI Security List is not sufficient.** The stock
+Ubuntu image drops it in host `iptables` independently. Open one layer and leave
+the other shut and you get the worst possible symptom: the load balancer marks
+the backend unhealthy while every setting in the OCI console reads correct.
 
 **Both layers must be open:**
 
 | Layer | Where | How |
 |---|---|---|
-| OCI Security List | OCI console — VCN → Security List | Ingress rules for TCP 80 and 443 |
+| OCI Security List | OCI console — VCN → Security List | Ingress rule for TCP 80 |
 | Host iptables | On the instance | `deploy/open-ports.sh` |
+
+**Port 80 is the one that matters.** TLS terminates at the load balancer, so
+nothing ever connects to this instance on 443. `open-ports.sh` opens both
+because it was written before that was settled; the 443 rule is inert and
+harmless, and the running chain in fact carries only the 80 ACCEPT.
 
 And the host chain has a second trap. It ends in:
 
@@ -85,7 +111,10 @@ Two SPEC statements were wrong and are corrected here: Docker and nginx were
 described as already "host-installed" and were not, and the 64 KB page-size risk
 does not apply — the kernel reports 4 KB pages.
 
-### Done
+### Done — every step below is live
+
+Steps 1–7 are complete and the service answers publicly. The step-by-step
+sections that follow are kept as the reproduction recipe, not as a to-do list.
 
 - [x] **Docker Engine 29.7.2 + Compose plugin v5.5.0**, from Docker's official
       apt repo for `noble`/`arm64`. `docker.service`, `docker.socket` and
@@ -103,23 +132,34 @@ does not apply — the kernel reports 4 KB pages.
       fix is `systemctl enable --now docker.socket` before starting
       `docker.service`, not a reinstall.
 
-- [x] **nginx 1.24.0** (Ubuntu noble), `enabled` and `active`. Still serving
-      only the stock `default` site.
+- [x] **nginx 1.24.0** (Ubuntu noble), `enabled` and `active`, serving
+      `linkedin-profile-api.conf`. The stock `default` site is removed — it also
+      claims `listen 80 default_server`, so nginx refuses to start with both.
 
-### Not done — these are yours to run
+- [x] **Host firewall** — TCP 80 accepted above the terminating REJECT, and
+      persisted (step 1). Verified: `sudo iptables -S INPUT` shows the 80
+      ACCEPT and the port-22 ACCEPT both above `REJECT`.
 
-The remaining steps were not executed: the cloud side of this deployment is
-owned by the operator, and the two inputs the last step needs (the load
-balancer's public IP, and the Origin Certificate + key) are not on the dev
-machine.
+- [x] **OCI Security List** — ingress for TCP 80 (step 2).
 
-- [ ] Host firewall — `deploy/open-ports.sh`, then persist (step 1)
-- [ ] OCI Security List ingress for 80/443 — console (step 2)
-- [ ] Repo + `.env` on the instance (step 3)
-- [ ] nginx site config (step 4)
-- [ ] Origin Certificate + key (step 5)
-- [ ] `docker compose up -d --wait` (step 6)
-- [ ] Load balancer backend + Cloudflare DNS (step 7)
+- [x] **Repo and `.env` on the instance** (step 3). `~/linkedin-profile-scrapper`,
+      remote `git@github.com:shreyasY2k/linkedin-profile-scrapper.git`.
+
+- [x] **nginx site config** (step 4), from
+      `deploy/nginx/linkedin-profile-api.conf`. Confirmed: nginx is the only
+      process listening off-loopback (`0.0.0.0:80`); 8000, 8080 and 5432 are
+      bound to `127.0.0.1` only.
+
+- [x] **TLS** (step 5) — **nothing to do on the instance.** The load balancer
+      holds the certificate. The Origin-Certificate step this runbook used to
+      carry was for the abandoned nginx-termination plan and has been deleted
+      rather than left to be reconciled.
+
+- [x] **`docker compose up -d --build --wait`** (step 6). All three services
+      healthy.
+
+- [x] **Load balancer backend + Cloudflare DNS** (step 7). Live and verified:
+      `https://shreyaskaushik.dpdns.org/health` → `{"status":"ok"}`.
 
 ---
 
@@ -158,9 +198,10 @@ OCI console → the VCN → the subnet's Security List → add **ingress** rules
 | Source | Protocol | Destination port |
 |---|---|---|
 | `0.0.0.0/0` | TCP | 80 |
-| `0.0.0.0/0` | TCP | 443 |
 
-Leave the existing port-22 rule alone.
+Leave the existing port-22 rule alone. **80 only** — the load balancer speaks
+HTTP to the instance, so nothing arrives on 443 and a 443 rule opens a port no
+process is listening on.
 
 ## Step 3 — Repo and `.env` on the instance
 
@@ -170,12 +211,13 @@ git clone https://github.com/shreyasY2k/linkedin-profile-scrapper.git
 cd linkedin-profile-scrapper
 ```
 
-> While the repository is still private, an unauthenticated clone fails with
-> `could not read Username for 'https://github.com'`. Either publish the
-> repository — the SPEC requires a public repo at submission anyway — or clone
-> once over forwarded SSH agent (`ssh -A oci-docker`, remote set to the `git@`
-> URL), which leaves no key on the instance. Do not put a GitHub credential on
-> the host.
+> While the repository is private, an unauthenticated clone fails with
+> `could not read Username for 'https://github.com'`. That is the state the
+> instance was set up in, so **its remote is the `git@` SSH URL** and pulls run
+> over a forwarded agent (`ssh -A oci-docker`), which leaves no key on the
+> instance. Do not put a GitHub credential on the host. Once the repository is
+> published, the HTTPS remote above works unauthenticated and is simpler:
+> `git remote set-url origin https://github.com/shreyasY2k/linkedin-profile-scrapper.git`.
 
 Then the environment file. **Do not type secrets into an interactive shell** —
 they land in `~/.bash_history`. Write the file with an editor, or generate the
@@ -234,51 +276,40 @@ sudo rm -f /etc/nginx/sites-enabled/default
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-`nginx -t` fails until step 5 puts the certificate in place — that is expected,
-and is why reload comes after. The config was validated against nginx 1.24.0
+`nginx -t` passes on its own: the config references no certificate and no key,
+so there is nothing to install first. (An earlier draft of this runbook said
+`nginx -t` would fail until a certificate was in place — that belonged to the
+abandoned nginx-termination plan.) The config was validated against nginx 1.24.0
 and exercised against the live API before it was committed (see "Verification").
 
-## Step 5 — Origin Certificate
+## Step 5 — TLS: nothing to install here
 
-Cloudflare dashboard → the zone → **SSL/TLS → Origin Server → Create
-Certificate**. Take the default (RSA, 15 years) for
-`shreyaskaushik.dpdns.org`. Cloudflare shows the key **once**.
+**This step is deliberately empty on the instance.** TLS terminates at the OCI
+load balancer, which holds the certificate; the certificate is attached to the
+load balancer's HTTPS listener in the OCI console, and Cloudflare sits in front
+of it, proxied.
 
-Install with the paths the site config expects:
-
-```bash
-sudo install -m 0644 -o root -g root /dev/null /etc/ssl/certs/shreyaskaushik.dpdns.org.pem
-sudo install -m 0600 -o root -g root /dev/null /etc/ssl/private/shreyaskaushik.dpdns.org.key
-
-sudo $EDITOR /etc/ssl/certs/shreyaskaushik.dpdns.org.pem   # paste the certificate
-sudo $EDITOR /etc/ssl/private/shreyaskaushik.dpdns.org.key # paste the private key
-```
-
-Paste into an editor. Do not `echo` the key into a file — that is a secret in
-shell history.
-
-Confirm the modes, then reload:
-
-```bash
-sudo ls -l /etc/ssl/private/shreyaskaushik.dpdns.org.key   # -rw------- root root
-sudo nginx -t && sudo systemctl reload nginx
-```
-
-Finally set Cloudflare **SSL/TLS → Overview → Full (strict)**. Order matters:
-switch to Full (strict) *before* the certificate is installed and Cloudflare
-returns **526** rather than serving anything in plaintext.
-
-The key exists only here, at mode 0600, root-owned, and never in the repository.
+The runbook previously described creating a Cloudflare Origin Certificate and
+installing it into `/etc/ssl` for nginx. That plan was abandoned during the
+story-2 deploy and the step has been removed rather than left for a reader to
+reconcile against a config that holds no `ssl` directive. **No private key, no
+certificate and no certbot exist on this host** — which is one fewer secret to
+protect and one fewer renewal to remember.
 
 ## Step 6 — Bring the stack up
 
 ```bash
 cd ~/linkedin-profile-scrapper
-docker compose up -d --wait
+docker compose up -d --build --wait
 ```
 
 Same compose file, same images, same Dockerfile as local. Only `.env` differs —
 there is no `APP_ENV` and nothing in the code branches on an environment name.
+
+**`--build` is not optional on a redeploy.** `docker compose up` happily reuses
+an image that is already built, so without it a `git pull` that brought new
+application source comes back up on the *old* code, healthy and wrong. This
+exact trap put the deployed instance one story behind for a while.
 
 `--wait` returns only once all three services report healthy; on a cold start
 with empty volumes this takes roughly 30 s, most of it Keycloak's first-boot
@@ -289,23 +320,81 @@ at import time, naming the offending field.
 Every service is `restart: unless-stopped`, so the stack returns after a reboot
 on its own.
 
+### Redeploying an existing instance
+
+```bash
+ssh oci-docker
+cd ~/linkedin-profile-scrapper
+git pull --ff-only
+docker compose up -d --build --wait
+docker compose ps                       # three healthy
+```
+
+> **Never `docker compose down -v` here.** The `pgdata` volume holds the
+> Keycloak realm, every encrypted session in the vault, and every cached
+> profile. `up -d --build` replaces the containers in place and leaves the
+> volume alone, which is what a redeploy should do.
+
+Then confirm from outside that the new build is actually the one answering:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' https://shreyaskaushik.dpdns.org/api/v1/nope
+# 401 — unmatched /api/v1 paths are behind auth (story 8).
+# 404 means an older image is still running: the --build was skipped.
+```
+
+### Re-exporting the Keycloak realm
+
+`deploy/keycloak/realm-linkedin.json` is committed with `${KEYCLOAK_CLIENT_SECRET}`
+and `${KEYCLOAK_SECOND_CLIENT_SECRET}` placeholders, substituted at import time.
+**Exporting from a running Keycloak does not preserve that** — `kc.sh export`
+emits the literal client secrets and the realm's signing key material, and
+committing the result would put real credentials in the public history.
+
+If the realm ever has to be re-exported, do it into a scratch directory outside
+the repository, then hand-edit the two secret values back to the `${...}`
+placeholders and diff against the committed file before staging anything:
+
+```bash
+docker compose exec keycloak /opt/keycloak/bin/kc.sh export \
+  --dir /tmp/realm-export --realm linkedin --users skip
+docker compose cp keycloak:/tmp/realm-export/linkedin-realm.json /tmp/
+# hand-edit /tmp/linkedin-realm.json: restore ${KEYCLOAK_CLIENT_SECRET} and
+# ${KEYCLOAK_SECOND_CLIENT_SECRET}, drop any `keys`/`components` key material,
+# then diff before copying it over the committed file.
+pre-commit run --all-files            # gitleaks is the backstop, not the plan
+```
+
 ## Step 7 — Load balancer and DNS
 
 Both are console changes.
 
-1. **OCI Load Balancer** — backend set containing `10.0.1.173`, listeners on 80
-   and 443 forwarding to the same ports on the backend.
+1. **OCI Load Balancer** — backend set containing `10.0.1.173` **on port 80**,
+   and a single **HTTPS listener on 443** carrying the certificate. The
+   listener terminates TLS and forwards plain HTTP to the backend's port 80.
+   There is no port-80 listener, which is why `http://shreyaskaushik.dpdns.org`
+   currently answers Cloudflare 522 rather than a redirect.
 
-   > **Health check:** point it at **`:443` `/health`**, or at `:80 /health`
-   > with **301 accepted**. Port 80 redirects everything to HTTPS, `/health`
-   > included, so an `:80` check expecting `200` marks a perfectly healthy
-   > backend as down. This is the same class of false negative as the firewall
-   > trap, and it is easy to spend an hour on.
+   > **Health check:** probe **`:80`**, path **`/`**, expecting **`200`**.
+   > Nothing on this instance speaks TLS, so a `:443` check can never pass, and
+   > nothing redirects, so there is no 301 to accept. `GET /` rather than
+   > `/health` because that is the path the load balancer actually requests
+   > (confirmed in the nginx access log: `10.0.0.60` requesting `/`), and
+   > `location = /` in the site config proxies it to the API's `/health`. The
+   > check is therefore truthful — 200 only while the API really answers, and
+   > 502 the moment it does not.
+   >
+   > An earlier version of this runbook told you to expect a 301 on `:80`. That
+   > belonged to the abandoned nginx-TLS plan and is wrong: nginx here does not
+   > redirect, deliberately, because it is handed `http` on requests the client
+   > made over HTTPS.
 
 2. **Cloudflare DNS** — an **A** record for `shreyaskaushik.dpdns.org` pointing
-   at the load balancer's public IP, **proxied** (orange cloud). The zone is
-   already on Cloudflare nameservers (`jerry` / `maria.ns.cloudflare.com`) and
-   currently has no A record at all.
+   at the load balancer's public IP, **proxied** (orange cloud). The zone is on
+   Cloudflare nameservers (`jerry` / `maria.ns.cloudflare.com`).
+
+   Consider switching **SSL/TLS → Edge Certificates → Always Use HTTPS** on. It
+   is off today, which is why plain `http://` 522s instead of redirecting.
 
 ---
 
@@ -320,31 +409,40 @@ being committed:
 |---|---|
 | `docker compose up -d --wait` from empty volumes | all three healthy in ~27 s |
 | `curl -fsS http://127.0.0.1:8000/health` | `{"status":"ok"}` |
-| Test suite (`docker build --target test`) | 44 passed |
+| Test suite (`docker build --target test`) | 925 passed, 17 skipped (the opt-in live checks) |
 | `nginx -t` on the site config, nginx 1.24.0 | syntax ok |
-| The site config in front of the real API | `http` → `301`, `https` → `HTTP/2 200` `{"status":"ok"}`, HSTS and nosniff present |
+| The site config in front of the real API | `HTTP/1.1 200` `{"status":"ok"}` on `/health`, HSTS and nosniff present |
 | Published ports reachable off-loopback | refused on 8000, 8080 and 5432 |
 
 The nginx config was exercised by running nginx 1.24 inside the API container's
 network namespace, so `proxy_pass http://127.0.0.1:8000` resolved to the real
 API and the file was tested verbatim.
 
-### To run once steps 1–7 are done
+### Verified live
 
 From a machine **outside** the instance's network:
 
 ```bash
 curl -fsS https://shreyaskaushik.dpdns.org/health          # {"status":"ok"}
-curl -sI  http://shreyaskaushik.dpdns.org/health           # 301 to the https URL
-curl -sv  https://shreyaskaushik.dpdns.org/health 2>&1 | grep -i "issuer\|subject"
+curl -sS -o /dev/null -w '%{http_code}\n' \
+     https://shreyaskaushik.dpdns.org/api/v1/nope          # 401, not 404
+curl -sS https://shreyaskaushik.dpdns.org/openapi.json \
+  | python3 -c "import sys,json;print(sorted(json.load(sys.stdin)['paths']))"
+# ['/api/v1/profile', '/api/v1/session', '/health']
 ```
+
+`curl -sI http://shreyaskaushik.dpdns.org/health` answers **522**, not a 301 —
+there is no port-80 listener on the load balancer and "Always Use HTTPS" is off
+at the Cloudflare edge. Everything graded uses `https://`. The certificate an
+`openssl s_client` shows is Cloudflare's edge certificate, not one of ours;
+there is no origin certificate to inspect.
 
 On the instance:
 
 ```bash
-ssh oci-docker 'sudo iptables -S INPUT'          # ACCEPT 80 and 443 ABOVE the REJECT
+ssh oci-docker 'sudo iptables -S INPUT'          # ACCEPT 80 ABOVE the REJECT
 ssh oci-docker 'cd linkedin-profile-scrapper && docker compose ps'   # three healthy
-ssh oci-docker 'sudo ss -tlnp'                   # nginx on 0.0.0.0:80/443;
+ssh oci-docker 'sudo ss -tlnp'                   # nginx on 0.0.0.0:80 only;
                                                  # 8000, 8080, 5432 on 127.0.0.1 only
 ssh oci-docker 'sudo systemctl is-enabled docker nginx'             # enabled, enabled
 ```

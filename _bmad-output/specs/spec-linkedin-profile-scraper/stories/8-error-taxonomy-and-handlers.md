@@ -2,7 +2,7 @@
 title: 'Error taxonomy and handlers'
 type: 'feature'
 created: '2026-08-27'
-status: 'in-review'
+status: 'done'
 baseline_commit: '02b90939ebabfe82f51e5b0c5f5d62f5d1cf999d'
 review_loop_iteration: 0
 context:
