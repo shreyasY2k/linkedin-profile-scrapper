@@ -2,7 +2,8 @@
 title: 'Profile extraction and response schema mapping'
 type: 'feature'
 created: '2026-08-27'
-status: 'draft'
+status: 'done'
+baseline_commit: '84b7dc9b8a7dd58d8a9650994910559b2d822c9b'
 review_loop_iteration: 0
 context:
   - '{project-root}/_bmad-output/specs/spec-linkedin-profile-scraper/SPEC.md'
@@ -81,20 +82,20 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `app/mapping/profile.py` — the pure mapper: raw entities in, contract-shaped dict plus the `partial[]` list out; never raises
-- [ ] `app/mapping/dates.py` — `dateRange` to `YYYY-MM` / `YYYY` at the source's own granularity
-- [ ] `app/mapping/images.py` — vector image to absolute URL
-- [ ] `app/api/v1/profile.py` — `GET /api/v1/profile`, mounted on the guarded router: session lookup, fetch, map, envelope
-- [ ] `app/api/v1/__init__.py` — mount it
-- [ ] `tests/fixtures/` — add a **sparse** profile fixture: missing sections, a current role with no end date, a certification with no expiry
-- [ ] `tests/test_mapping.py` — every matrix row, and every absent-versus-unreadable pairing explicitly
-- [ ] `tests/test_profile_api.py` — the endpoint end to end against a real token and a stubbed client
-- [ ] `README.md` — the second graded `curl`, verified verbatim
+- [x] `app/mapping/profile.py` — the pure mapper: raw entities in, contract-shaped dict plus the `partial[]` list out; never raises
+- [x] `app/mapping/dates.py` — `dateRange` to `YYYY-MM` / `YYYY` at the source's own granularity
+- [x] `app/mapping/images.py` — vector image to absolute URL
+- [x] `app/api/v1/profile.py` — `GET /api/v1/profile`, mounted on the guarded router: session lookup, fetch, map, envelope
+- [x] `app/api/v1/__init__.py` — mount it
+- [x] `tests/fixtures/` — add a **sparse** profile fixture: missing sections, a current role with no end date, a certification with no expiry
+- [x] `tests/test_mapping.py` — every matrix row, and every absent-versus-unreadable pairing explicitly
+- [x] `tests/test_profile_api.py` — the endpoint end to end against a real token and a stubbed client
+- [x] `README.md` — the second graded `curl`, verified verbatim
 
 **Acceptance Criteria:**
 - Given a profile with a genuinely empty section, when it is mapped, then that field is `[]` or `null` and its name does **not** appear in `partial[]`.
 - Given a section whose fetch failed, when it is mapped, then its key is absent from `profile` and its name **does** appear in `partial[]`.
-- Given any experience entry, when it is serialised, then its dates match `^\d{4}-\d{2}$` or are `null`, and no date carries day or time precision.
+- Given any experience entry, when it is serialised, then its dates match `^\d{4}(-\d{2})?$` or are `null`, and no date carries day or time precision. (Amended during review, author-approved: `YYYY` is accepted because LinkedIn permits a year-only position date, and rendering that as `null` republished a finished job as a current role — `end: null` means "still held". `response-schema.md` was amended to match.)
 - Given any malformed or unexpected raw entity, when it is mapped, then a response is still produced and no exception escapes.
 - Given a caller with no stored session, when they request a profile, then `NO_SESSION` is returned before any upstream call is made.
 
@@ -115,6 +116,14 @@ context:
 **Region is not available.** The core entity gives `location.countryCode` and a `geoLocation.geoUrn`; no readable region name comes back. `response-schema.md` says `country`, `region` "where separable", so `region` is `null` — genuinely absent, not unreadable. Do not spend a seventh call resolving the geo URN.
 
 **Current roles.** A present role has `dateRange.end` absent; the contract wants `end: null`. That is absent-not-unreadable, and it must not reach `partial[]`.
+
+**Author decisions, 2026-08-27 — three Ask First items resolved.**
+
+1. **`employment_type` is omitted and named in `partial[]`** when it resolves only to a raw URN (`urn:li:fsd_employmentType:12`, which is every position on the live profile). A raw URN is an unreadable value dressed as a readable one, so reporting it as the value violates this story's own central rule. Do not guess enum labels for someone's real job.
+
+2. **`location.region` is now resolvable — in the SAME call, not a seventh one.** Verified live: adding `&decorationId=com.linkedin.voyager.dash.deco.identity.profile.FullProfile-77` to the existing core request returns `Geo` entities in `included[]`, joined from `Profile.geoLocation["*geo"]`, carrying `defaultLocalizedName` (measured: `"Bengaluru, Karnataka, India"`, plus a country-level `"India"`). The call budget is unchanged. `country` still comes from `location.countryCode`; `region` comes from the joined Geo name and may have a redundant trailing country trimmed — never invented. **The decoration id is version-pinned and brittle**: if the decorated request fails, fall back to the undecorated one and treat `region` as absent rather than failing the fetch.
+
+3. **`response-schema.md` is amended so experience dates accept `YYYY-MM` **or** `YYYY`.** LinkedIn permits a position dated to the year alone, and the previous contract forced that to `null` — discarding data the source had. This matches the SPEC's principle that dates keep the granularity LinkedIn actually exposes. Update the contract file, the mapper, and the acceptance criterion together.
 
 ## Verification
 

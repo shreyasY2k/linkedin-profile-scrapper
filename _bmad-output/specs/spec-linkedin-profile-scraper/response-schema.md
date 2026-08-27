@@ -16,12 +16,16 @@ Requires `Authorization: Bearer {keycloak_jwt}`. Requires that the calling subje
   "public_id": "example",
   "stale": false,
   "fetched_at": "2026-08-27T09:00:00Z",
+  "partial": [],
   "profile": { }
 }
 ```
 
 - `stale` — `false` when `profile` came from a live retrieval during this request, `true` when the live call failed and a cached record was served instead.
 - `fetched_at` — when the returned `profile` was actually retrieved from LinkedIn, not when the request was served. On a stale response this is the older timestamp, and it is the value that makes staleness actionable.
+- `partial` — the names of fields that could not be retrieved in this run. **Always present**, and `[]` on a complete answer. It is never omitted and never `null`: a consumer must be able to read it unconditionally, because "there is nothing in it" and "this response predates the field" have to be distinguishable. See *Absent versus unreadable* below.
+
+`url` is the canonical `https://www.linkedin.com/in/{public_id}` form of the profile that was fetched, not the string the caller supplied — a caller's URL may carry a locale prefix, a `/details/...` sub-path, tracking parameters or arbitrary case, and `url` and `public_id` are guaranteed to agree with each other.
 
 ## Profile object
 
@@ -47,11 +51,18 @@ Every field below is required by the assignment. Absent-versus-null semantics ar
 
 A response is never silently defaulted. `partial` being non-empty on an otherwise-200 response is the signal that extraction degraded without failing.
 
+There is no third state. In particular an unreadable value is never published in a readable value's place: an internal URN standing in for a human-readable label is an unreadable value, and it is omitted like any other.
+
+**Any field in the profile object may appear in `partial`**, not only the array-valued ones. Extraction is contained per field, so a scalar that could not be read is omitted and named in exactly the same way.
+
+**Dotted sub-field paths.** An entry in `partial` may name a sub-field of an array, e.g. `experience.employment_type`. It means: that sub-field was unreadable for at least one entry in that array and is **omitted from the entries where it could not be read**. Entries where it was readable still carry it, and an entry whose source genuinely states no value keeps `null` — absence, which never appears in `partial`.
+
 ### Entry shapes
 
 ```
 experience[]     title, company, company_url, employment_type, location,
-                 start (YYYY-MM), end (YYYY-MM | null for current), description
+                 start (YYYY-MM | YYYY), end (YYYY-MM | YYYY | null for current),
+                 description
 education[]      school, school_url, degree, field_of_study,
                  start (YYYY), end (YYYY | null)
 certifications[] name, issuer, issued (YYYY-MM | null), credential_url
@@ -59,6 +70,14 @@ languages[]      name, proficiency
 ```
 
 Dates are strings in the stated granularity, not full timestamps — LinkedIn does not expose day precision, and inventing it would misrepresent the source.
+
+**Experience dates accept two precisions, and the reason is load-bearing.** LinkedIn lets a member date a position with a year and no month. Rendering that as `null` was tried and is wrong: `end: null` is defined here as *the person still holds this role*, so a position ending in 2019 with no month would be republished as a current job — an invented fact about someone's employment, produced by a rule written to avoid inventing facts. Rendering it as `2019-01` is equally an invention. So `start` and `end` carry whichever precision the source actually stated, and a consumer distinguishes them by length: `^\d{4}(-\d{2})?$`.
+
+`certifications[].issued` stays strictly `YYYY-MM`. `issued` has no null-means-current meaning, so a year-only value there is a plain absence rather than a false claim.
+
+`employment_type` is LinkedIn's readable label, `null` when the position states none, or **absent** when LinkedIn referenced a type without delivering a readable name for it — in which case `partial` carries `experience.employment_type`.
+
+`location.region` is the member's place as LinkedIn names it, with a redundant trailing country name trimmed since `country` has its own field. It is `null` when no readable place name is available, which is an absence rather than a failure.
 
 ## Session endpoints
 

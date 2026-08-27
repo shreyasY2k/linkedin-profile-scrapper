@@ -1,0 +1,24 @@
+{
+  "data": {
+    "entityUrn": "urn:li:fsd_profileCollection:SYNTHETIC-sparse",
+    "paging": {
+      "count": 10,
+      "start": 0,
+      "links": []
+    },
+    "*elements": [
+      "urn:li:fsd_profile:SYNTHETIC-sparse-placeholder"
+    ],
+    "$type": "com.linkedin.restli.common.CollectionResponse"
+  },
+  "included": [
+    {
+      "entityUrn": "urn:li:fsd_profile:SYNTHETIC-sparse-placeholder",
+      "publicIdentifier": "sparse-placeholder",
+      "firstName": "Sparse",
+      "lastName": "Placeholder",
+      "headline": "",
+      "$type": "com.linkedin.voyager.dash.identity.profile.Profile"
+    }
+  ]
+}

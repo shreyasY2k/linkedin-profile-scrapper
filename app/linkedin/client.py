@@ -143,6 +143,23 @@ SECTION_RESOURCES: Mapping[str, str] = {
 CORE_RESOURCE = "identity/dash/profiles"
 ME_RESOURCE = "me"
 
+#: Asks the core request to deliver the referenced entities inline instead of
+#: only their URNs. **Verified live on 2026-08-27**: with this, ``included``
+#: carries ``com.linkedin.common.Geo`` entities joined from
+#: ``Profile.geoLocation["*geo"]``, each with a ``defaultLocalizedName``
+#: (measured: ``"Bengaluru, Karnataka, India"`` and a country-level ``"India"``).
+#:
+#: This is the whole reason ``location.region`` is populated, and it costs
+#: **nothing**: it is a query parameter on a request the fetch already makes, so
+#: the per-profile budget is still six calls. Resolving the geo URN with a
+#: seventh call was the alternative, and it is Ask First.
+#:
+#: The id is version-pinned (`-77`) and therefore brittle by construction —
+#: LinkedIn revises these without notice. :meth:`VoyagerClient._fetch_core`
+#: falls back to the undecorated request when it is refused, because a nicety
+#: must never take down the fetch it decorates.
+CORE_DECORATION_ID = "com.linkedin.voyager.dash.deco.identity.profile.FullProfile-77"
+
 #: Elements requested per section. **Verified live on 2026-08-27**, and not an
 #: optimisation — a correctness fix for data loss that was already happening.
 #:
@@ -988,10 +1005,46 @@ class VoyagerClient:
         return profile
 
     async def _fetch_core(self, public_id: str) -> dict[str, Any]:
-        """The one call whose failure aborts the whole fetch."""
-        query = urllib.parse.urlencode(
-            {"q": "memberIdentity", "memberIdentity": public_id}
-        )
+        """The one call whose failure aborts the whole fetch.
+
+        Made **decorated** first (:data:`CORE_DECORATION_ID`), which is what
+        delivers the ``Geo`` entities ``location.region`` is built from, at no
+        extra call.
+
+        The decoration id is version-pinned and LinkedIn revises these without
+        notice, so a refusal falls back to the plain request and the profile
+        comes back without a region. The fallback is deliberately narrow — only
+        ``UPSTREAM_ERROR``, which is what a rejected or withdrawn decoration
+        looks like (400, 410, an unparseable body).
+
+        It must NOT retry a systemic failure. An expired session, a throttle or
+        a challenge is a fact about the account: a second call cannot succeed,
+        and spending one against an account LinkedIn is already throttling makes
+        the condition worse. Nor a 404 — that is a statement about the member,
+        not about the decoration. So the seven-call case is exactly "the
+        decoration broke", and the ordinary paths still cost six.
+        """
+        try:
+            return await self._fetch_core_once(public_id, decorated=True)
+        except ApiError as exc:
+            if exc.code != "UPSTREAM_ERROR":
+                raise
+            logger.warning(
+                "Decorated core request failed (%s); retrying undecorated. "
+                "location.region will be absent. If this persists, "
+                "CORE_DECORATION_ID in app/linkedin/client.py is out of date.",
+                exc.log_detail or exc.code,
+            )
+        return await self._fetch_core_once(public_id, decorated=False)
+
+    async def _fetch_core_once(
+        self, public_id: str, *, decorated: bool
+    ) -> dict[str, Any]:
+        """One core request, decorated or not, validated the same way either way."""
+        parameters: dict[str, Any] = {"q": "memberIdentity", "memberIdentity": public_id}
+        if decorated:
+            parameters["decorationId"] = CORE_DECORATION_ID
+        query = urllib.parse.urlencode(parameters)
         payload = await self._request(f"{CORE_RESOURCE}?{query}", resource=CORE_RESOURCE)
 
         if not is_collection_envelope(payload):

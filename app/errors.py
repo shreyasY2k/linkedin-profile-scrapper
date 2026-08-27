@@ -132,6 +132,38 @@ ERROR_SPECS: dict[str, ErrorSpec] = {
 }
 
 
+#: Every error this API returns is uncacheable, and that is a correctness rule
+#: rather than a performance one.
+#:
+#: These responses are **caller-specific**. `428 NO_SESSION` means "*you* have
+#: not stored a session"; `401 UNAUTHENTICATED` means "*your* token is bad".
+#: Nothing about them varies by anything a shared cache keys on except the
+#: bearer token, and caches do not key on Authorization. Deployed, this service
+#: sits behind host nginx, an OCI load balancer and a Cloudflare edge — so one
+#: caller's 428 cached and replayed to a second caller would tell somebody with
+#: a perfectly good session to go and store one, and a cached 401 would lock out
+#: a valid token for the life of the entry.
+#:
+#: The success path sets this on its own response. Setting it HERE rather than
+#: per route is what makes it true for the paths nobody enumerated: an ApiError
+#: raised in a dependency, Starlette's own 404 and 405, a validation 422, and
+#: the last-resort 500 all render through this module and inherit it.
+NO_STORE = {"Cache-Control": "no-store"}
+
+
+def _uncacheable(headers: Mapping[str, str] | None) -> dict[str, str]:
+    """``headers`` plus ``Cache-Control: no-store``.
+
+    An explicit `Cache-Control` from a call site wins — there is no such call
+    site today, and if one appears it should be a deliberate act rather than
+    something this helper silently overrules.
+    """
+    merged = dict(headers) if headers else {}
+    if not any(name.lower() == "cache-control" for name in merged):
+        merged.update(NO_STORE)
+    return merged
+
+
 class ApiError(Exception):
     """An outcome the API states in the typed envelope rather than raising into.
 
@@ -169,7 +201,7 @@ class ApiError(Exception):
         return JSONResponse(
             status_code=self.spec.status_code,
             content=body.model_dump(),
-            headers=self.headers,
+            headers=_uncacheable(self.headers),
         )
 
 
@@ -268,7 +300,7 @@ def envelope(
     return JSONResponse(
         status_code=status_code,
         content=body.model_dump(),
-        headers=dict(headers) if headers else None,
+        headers=_uncacheable(headers),
     )
 
 

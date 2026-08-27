@@ -25,6 +25,7 @@
       "industryUrn": "urn:li:fsd_industry:4",
       "geoLocation": {
         "geoUrn": "urn:li:fsd_geo:100000000",
+        "*geo": "urn:li:fsd_geo:100000000",
         "$type": "com.linkedin.voyager.dash.identity.profile.ProfileGeoLocation"
       },
       "location": {
@@ -90,6 +91,16 @@
         "$type": "com.linkedin.voyager.dash.common.image.Photo"
       },
       "$type": "com.linkedin.voyager.dash.identity.profile.Profile"
+    },
+    {
+      "entityUrn": "urn:li:fsd_geo:100000000",
+      "defaultLocalizedName": "Placeholder City, Testland",
+      "$type": "com.linkedin.common.Geo"
+    },
+    {
+      "entityUrn": "urn:li:fsd_geo:100000001",
+      "defaultLocalizedName": "Testland",
+      "$type": "com.linkedin.common.Geo"
     }
   ]
 }

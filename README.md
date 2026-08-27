@@ -6,11 +6,10 @@ retrieved under the caller's own LinkedIn session.
 > **This README is incomplete.** Story 1 wrote the **Setup** section; story 3
 > added **Get a token** to it, including the first of the two copy-paste `curl`
 > commands CAP-3 is graded on; story 5 added **Store your LinkedIn session**,
-> which the second `curl` depends on. Story 9 owns the remaining three required
-> sections — **API documentation**, **Approach**, and **Known limitations** —
-> and that second `curl`, which needs the profile route stories 6-8 ship.
-> Placeholders below mark where they go. Do not delete the placeholders; fill
-> them.
+> which the second `curl` depends on; story 6 added **Fetch a profile**, which
+> is that second `curl`. Story 9 owns the remaining three required sections —
+> **API documentation**, **Approach**, and **Known limitations**. Placeholders
+> below mark where they go. Do not delete the placeholders; fill them.
 
 ---
 
@@ -232,6 +231,145 @@ What that endpoint deliberately does **not** do:
 `li_at` cookies are long-lived but not permanent, and LinkedIn invalidates them
 on password change and on some security events. When that happens, repeat the
 `PUT`.
+
+### Fetch a profile
+
+This is the second of the two copy-paste `curl` commands the submission is
+graded on. The first minted a token; this one uses it.
+
+```bash
+set -a; . ./.env; set +a
+
+TOKEN=$(curl -fsS -X POST \
+  -d grant_type=client_credentials \
+  -d "client_id=$KEYCLOAK_CLIENT_ID" \
+  -d "client_secret=$KEYCLOAK_CLIENT_SECRET" \
+  "$KEYCLOAK_ISSUER_URL/realms/$KEYCLOAK_REALM/protocol/openid-connect/token" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+
+curl -fsS -G http://127.0.0.1:8000/api/v1/profile \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode 'url=https://www.linkedin.com/in/example'
+```
+
+`-G --data-urlencode` rather than pasting the URL into the path: a LinkedIn
+profile URL carries `?trk=...` tracking parameters and sometimes non-ASCII
+public ids, and both need encoding to survive as a query value.
+
+The answer is the envelope from `response-schema.md`:
+
+```json
+{
+  "url": "https://www.linkedin.com/in/example",
+  "public_id": "example",
+  "stale": false,
+  "fetched_at": "2026-08-27T09:00:00Z",
+  "partial": ["experience.employment_type"],
+  "profile": {
+    "name": {"first": "…", "last": "…", "full": "…"},
+    "headline": "…",
+    "location": {"country": "IN", "region": "Bengaluru, Karnataka"},
+    "about": "…",
+    "experience": [
+      {
+        "title": "…", "company": "…",
+        "company_url": "https://www.linkedin.com/company/1234",
+        "location": "…",
+        "start": "2023-03", "end": null,
+        "description": "…"
+      }
+    ],
+    "education": [{"school": "…", "school_url": "…", "degree": "…",
+                   "field_of_study": "…", "start": "2016", "end": "2020"}],
+    "skills": ["…"],
+    "certifications": [{"name": "…", "issuer": "…", "issued": "2022-11",
+                        "credential_url": "…"}],
+    "languages": [{"name": "…", "proficiency": "NATIVE_OR_BILINGUAL"}],
+    "images": {"profile": "https://…", "background": "https://…"}
+  }
+}
+```
+
+**Read `partial` before you read `profile`.** It is the whole of the
+absent-versus-unreadable contract, and it is what makes a degraded answer
+honest rather than misleading:
+
+- A section the member **genuinely does not have** comes back as `[]` (or
+  `null` for a scalar), the key is present, and its name is **not** in
+  `partial`. That is a positive statement: this person has no certifications.
+- A section this run **could not retrieve** — the sub-request failed, or
+  LinkedIn said there were more entries than it returned — has its key
+  **omitted from `profile` entirely** and its name listed in `partial`. That
+  says: we do not know, and we are not going to guess.
+
+So `"certifications": []` and `"partial": ["certifications"]` are two different
+answers, and a client can branch on them without parsing prose. A non-empty
+`partial` on an otherwise-200 response is the signal that extraction degraded
+without failing. `partial` is **always present** and is `[]` on a complete
+answer — it is never omitted, so you can read it unconditionally.
+
+**Dotted names are sub-fields.** `experience.employment_type` means that
+sub-field was unreadable for at least one entry in that array and is omitted
+from the entries where it could not be read; entries where it was readable
+still carry it. Any field in the profile object may appear in `partial`, not
+only the array-valued ones.
+
+You will see `experience.employment_type` on most real profiles, and that is
+correct rather than a defect. LinkedIn references an employment type on each
+position (`urn:li:fsd_employmentType:12`) and delivers nothing that names it.
+Publishing the URN in a field you would read as "Full-time" is an unreadable
+value dressed as a readable one, and decoding it from a remembered table would
+be this service guessing at a label for someone's job. So it is omitted and
+reported, which is what the rest of this contract does with anything it could
+not read.
+
+A few things the shape deliberately does **not** do:
+
+- **Dates keep the source's own precision.** Experience dates are `YYYY-MM`, or
+  `YYYY` when LinkedIn stated only a year; education is `YYYY`; certifications
+  are `YYYY-MM`. Never widened into a timestamp — LinkedIn does not expose day
+  precision, and inventing one would misrepresent the source.
+- **`"end": null` on a position means the person still holds it**, and nothing
+  else. A finished role whose end date carries only a year renders as `"2019"`,
+  never `null`. (It did render as `null` in an earlier draft, which republished
+  finished jobs as current ones — the two precisions exist to prevent exactly
+  that.)
+- **`location.region` costs no extra call.** It is resolved from the geo entity
+  the core request already returns, and a redundant trailing country name is
+  trimmed because `country` has its own field. It is `null` when LinkedIn
+  delivers no readable place name — an absence, not a failure, so it never
+  appears in `partial`.
+- **`employment_type` is never a raw URN.** See the `partial` note above.
+
+Errors wear the same typed envelope as everything else:
+
+| You get | When |
+|---|---|
+| `400 INVALID_URL` | not a `/in/{public-id}` URL — rejected before any LinkedIn call |
+| `401 UNAUTHENTICATED` | missing, expired or foreign-realm token |
+| `428 NO_SESSION` | you have not stored a LinkedIn session yet |
+| `428 SESSION_EXPIRED` | LinkedIn refused your stored cookie; store a new one |
+| `404 PROFILE_NOT_FOUND` | no such member, or not visible to your session |
+| `429 RATE_LIMITED` | LinkedIn throttled us; `Retry-After` when it says |
+| `502 UPSTREAM_CHALLENGE` | LinkedIn served a challenge or authwall |
+| `502 UPSTREAM_ERROR` | any other upstream failure — a withdrawn endpoint, an unreadable body, or the whole fetch exceeding its deadline |
+| `422 INVALID_REQUEST` | the `url` query parameter is missing entirely |
+| `503 SERVICE_UNAVAILABLE` | this service could not reach its own datastore |
+| `500 INTERNAL_ERROR` | a bug here. It still wears the envelope above; nothing ever returns a naked 500 or a stack trace |
+
+Every one of these is `Cache-Control: no-store`, including the successful
+response: these bodies are specific to *you*, and a shared cache in front of the
+service keys on nothing that distinguishes one caller from another.
+
+Each request costs **six** live calls to LinkedIn: one for the core profile,
+then five concurrent section calls. There is no retry — the failures worth
+retrying are the ones an immediate retry makes worse. (One exception, and it is
+not a retry of a failure: if LinkedIn refuses the decoration the core request
+asks for, that one call is repeated without it, and the profile comes back
+without a `region`. A brittle nicety must not take down the fetch.)
+
+Each call has a 15s timeout and the whole fetch has a 45s backstop, so a wedged
+upstream cannot hold a request open indefinitely.
 
 ### Prove the isolation (two callers, two sessions)
 
@@ -469,16 +607,28 @@ app/
     health.py        unauthenticated GET /health
     v1/__init__.py   APIRouter(prefix="/api/v1") — the seam AND the auth boundary
     v1/session.py    PUT|GET /api/v1/session; presence in, never the value out
+    v1/profile.py    GET /api/v1/profile — the graded endpoint: session lookup,
+                     fetch, map, envelope
   linkedin/
     client.py        the Voyager client: the ONLY place that puts a LinkedIn
                      session on the wire, calls linkedin.com, or knows the
                      endpoint map
+  mapping/
+    profile.py       raw entities to response-schema.md, and the absent-versus-
+                     unreadable decision that fills partial[]
+    dates.py         dateRange to YYYY-MM / YYYY at the source's own precision
+    images.py        a vectorImage joined into one absolute URL
+    text.py          the ONE place text and URLs are judged publishable
 tests/
   test_health.py     liveness + missing-configuration coverage
   test_auth.py       the full token-rejection matrix, signed offline
   test_vault.py      the vault matrix: encryption at rest, subject isolation,
                      overwrite, rotated keys — no Postgres, no network
   test_session_api.py  both session endpoints end to end against a real token
+  test_mapping.py    the mapping matrix — absent versus unreadable, asserted
+                     both ways for every section
+  test_profile_api.py  GET /api/v1/profile end to end, stubbed client
+  support.py         shared test helpers — the single seam between test modules
   test_linkedin_client.py  the retrieval edge-case matrix, entirely offline
   test_linkedin_live.py    the one opt-in live check; skipped by default
   fixtures/          synthetic Voyager payloads — invented people, .invalid

@@ -1,0 +1,31 @@
+{
+  "data": {
+    "entityUrn": "urn:li:fsd_profilePositionCollection:SYNTHETIC-sparse",
+    "paging": {
+      "count": 10,
+      "start": 0,
+      "links": [],
+      "total": 1
+    },
+    "*elements": [
+      "urn:li:fsd_profilePosition:(SYNTHETIC-sparse,1)"
+    ],
+    "$type": "com.linkedin.restli.common.CollectionResponse"
+  },
+  "included": [
+    {
+      "entityUrn": "urn:li:fsd_profilePosition:(SYNTHETIC-sparse,1)",
+      "title": "Sole Synthetic Role",
+      "companyName": "Example Robotics",
+      "dateRange": {
+        "start": {
+          "month": 5,
+          "year": 2024,
+          "$type": "com.linkedin.common.Date"
+        },
+        "$type": "com.linkedin.common.DateRange"
+      },
+      "$type": "com.linkedin.voyager.dash.identity.profile.Position"
+    }
+  ]
+}

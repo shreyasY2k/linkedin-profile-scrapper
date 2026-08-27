@@ -1,0 +1,30 @@
+{
+  "data": {
+    "entityUrn": "urn:li:fsd_profileCertificationCollection:SYNTHETIC-sparse",
+    "paging": {
+      "count": 10,
+      "start": 0,
+      "links": [],
+      "total": 1
+    },
+    "*elements": [
+      "urn:li:fsd_profileCertification:(SYNTHETIC-sparse,1)"
+    ],
+    "$type": "com.linkedin.restli.common.CollectionResponse"
+  },
+  "included": [
+    {
+      "entityUrn": "urn:li:fsd_profileCertification:(SYNTHETIC-sparse,1)",
+      "name": "Certificate With No Expiry And No Issuer Page",
+      "dateRange": {
+        "start": {
+          "month": 1,
+          "year": 2021,
+          "$type": "com.linkedin.common.Date"
+        },
+        "$type": "com.linkedin.common.DateRange"
+      },
+      "$type": "com.linkedin.voyager.dash.identity.profile.Certification"
+    }
+  ]
+}

@@ -1207,8 +1207,102 @@ def test_a_core_failure_aborts_the_whole_fetch() -> None:
     error = expect_api_error(lambda: fetch(client))
 
     assert error.code == "UPSTREAM_ERROR"
-    # The core call is made alone, so nothing else was spent on a doomed fetch.
-    assert len(client.transport.calls) == 1  # type: ignore[attr-defined]
+    # Nothing was spent on the sections of a doomed fetch — that is the
+    # invariant, and it is what "aborts the whole fetch" means.
+    calls = client.transport.calls  # type: ignore[attr-defined]
+    assert not [
+        call for call in calls if any(r in call.url for r in SECTION_RESOURCES.values())
+    ]
+    # The core is attempted at most twice, and only because an UPSTREAM_ERROR is
+    # indistinguishable from a rejected decoration. See `_fetch_core`.
+    assert len(calls) <= 2, [call.url for call in calls]
+
+
+# --- The core decoration, and the fallback that must not cost the fetch ---------
+
+
+def core_calls(client: VoyagerClient) -> list[str]:
+    return [
+        call.url
+        for call in client.transport.calls  # type: ignore[attr-defined]
+        if CORE_RESOURCE + "?" in call.url
+    ]
+
+
+def test_the_core_request_asks_for_the_decoration_that_carries_the_geo_entities() -> None:
+    """This is the whole reason `location.region` can be populated at all.
+
+    It is a query parameter on a request the fetch already makes, so the
+    per-profile budget is still six calls — the alternative was a seventh call
+    to resolve the geo URN, which the story puts behind Ask First.
+    """
+    client = make_client()
+
+    fetch(client)
+
+    assert len(core_calls(client)) == 1
+    assert voyager.CORE_DECORATION_ID in core_calls(client)[0]
+    assert client.call_count == 6, "the decoration must not cost an extra call"
+
+
+def test_a_refused_decoration_falls_back_and_still_returns_the_profile() -> None:
+    """The id is version-pinned and LinkedIn revises these without notice.
+
+    A brittle nicety must never take down the fetch it decorates: the profile
+    comes back, without the Geo entities, and `location.region` is then absent.
+    """
+    answered: list[str] = []
+
+    def core(url: str, headers: dict[str, str]) -> VoyagerResponse:
+        answered.append(url)
+        if voyager.CORE_DECORATION_ID in url:
+            return status_response(400)
+        return json_response(load_fixture("voyager_core.json"))
+
+    client = make_client(override("core", core))
+
+    profile = fetch(client)
+
+    assert profile.public_id == PUBLIC_ID
+    assert len(answered) == 2 and voyager.CORE_DECORATION_ID not in answered[1]
+    assert profile.call_count == 7, "the fallback costs exactly one extra call"
+
+
+@pytest.mark.parametrize(
+    "outcome,code",
+    [
+        (status_response(401), "SESSION_EXPIRED"),
+        (status_response(429), "RATE_LIMITED"),
+        (html_response(), "UPSTREAM_CHALLENGE"),
+    ],
+)
+def test_a_systemic_failure_is_never_retried_undecorated(
+    outcome: Any, code: str
+) -> None:
+    """A second call cannot succeed and makes a throttle worse.
+
+    An expired session, a throttle and a challenge are all facts about the
+    ACCOUNT. Retrying spends quota against an account LinkedIn is already
+    refusing, for a call that will be refused identically.
+    """
+    client = make_client(override("core", outcome))
+
+    error = expect_api_error(lambda: fetch(client))
+
+    assert error.code == code
+    assert len(core_calls(client)) == 1
+
+
+def test_an_unknown_profile_is_not_retried_undecorated() -> None:
+    """A 404 is a statement about the member, not about the decoration."""
+    empty = load_fixture("voyager_core.json")
+    empty["data"]["*elements"] = []
+    client = make_client(override("core", json_response(empty)))
+
+    error = expect_api_error(lambda: fetch(client))
+
+    assert error.code == "PROFILE_NOT_FOUND"
+    assert len(core_calls(client)) == 1
 
 
 def test_a_degraded_fetch_is_logged_with_the_section_names(
@@ -1651,6 +1745,13 @@ COOKIE_HANDLING_MODULES = {
     # Story 5, and the two that were predicted above:
     "app/vault.py",  # encrypts and decrypts it; the ONLY place it is plaintext
     "app/api/v1/session.py",  # names it as the PUT body field response-schema.md fixes
+    # Story 6. It is listed because it genuinely handles the plaintext value:
+    # it unlocks the caller's session and hands `reveal()` to the fetcher. That
+    # is the one hop between the vault and the client, and it is deliberate. It
+    # never logs, stores or returns the value — `tests/test_profile_api.py`
+    # asserts the cookie appears in no response, and the module's docstring
+    # explains why the seam exists.
+    "app/api/v1/profile.py",
 }
 
 
@@ -1737,6 +1838,11 @@ SYNTHETIC_IDENTIFIERS = {
     "ada-placeholder",
     "Ada",
     "Placeholder",
+    # Story 6's sparse profile: a member who genuinely has almost nothing, so
+    # that "the section is empty" and "the section is unreadable" have a
+    # fixture apiece rather than sharing one.
+    "sparse-placeholder",
+    "Sparse",
     # The decoy in voyager_me.json, which exists so that a first-hit scan of
     # `included` returns the wrong person and fails a test.
     "decoy-placeholder",
@@ -1868,9 +1974,34 @@ def test_the_core_fixture_carries_every_field_story_6_needs() -> None:
     assert "geoUrn" in profile["geoLocation"]
     assert "countryCode" in profile["location"]
     # `location` is thin: a country code and a geo URN, no human-readable region.
-    # `response-schema.md` wants `{country, region}`; resolving that URN is
-    # story 6's problem, and this is where it discovers the problem exists.
+    # `response-schema.md` wants `{country, region}`, and the region is NOT in
+    # here — it arrives as a separate `Geo` entity in `included`, and only
+    # because the core request is decorated. See the test below.
     assert "region" not in profile["location"]
+
+
+def test_the_core_fixture_mirrors_the_decorated_shape_region_is_built_from() -> None:
+    """Measured live on 2026-08-27 with `CORE_DECORATION_ID` on the core call.
+
+    A fixture that lost this would let the mapper's region path be written
+    against a shape LinkedIn does not send, and `location.region` would silently
+    go back to being permanently `null`.
+    """
+    core = load_fixture("voyager_core.json")
+    profile = core["included"][0]
+
+    reference = profile["geoLocation"]["*geo"]
+    geos = {
+        entity["entityUrn"]: entity
+        for entity in core["included"]
+        if str(entity.get("$type", "")).endswith("common.Geo")
+    }
+
+    assert reference in geos, "the *geo reference must resolve inside `included`"
+    assert "defaultLocalizedName" in geos[reference]
+    # A country-level Geo sits beside the member's own, which is what makes the
+    # redundant-trailing-country trim exercisable.
+    assert len(geos) >= 2
 
 
 def test_experience_dates_carry_month_precision_and_education_does_not() -> None:
