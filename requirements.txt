@@ -4,3 +4,16 @@ fastapi==0.141.1
 uvicorn[standard]==0.52.4
 pydantic==2.13.4
 pydantic-settings==2.15.0
+
+# Story 3: JWT validation against the realm JWKS.
+#
+# PyJWT alone can only do HMAC. `cryptography` is the asymmetric backend that
+# makes RS256 verification possible — without it the only algorithm this
+# service could verify is the one it must categorically refuse. It is pinned
+# on its own line rather than left to the `pyjwt[crypto]` extra so the exact
+# version is visible here, as every other pin is.
+#
+# The JWKS fetch itself uses stdlib urllib, deliberately: no HTTP client is
+# added for one GET against a service on the compose network.
+pyjwt==2.13.0
+cryptography==50.0.1

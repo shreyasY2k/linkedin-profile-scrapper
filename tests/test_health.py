@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from app.api.v1 import router as v1_router
+from app.auth import require_claims
 from app.config import Settings
 from app.main import create_app
 from tests.conftest import REQUIRED_ENV
@@ -67,10 +68,62 @@ def test_v1_router_carries_the_prefix_response_schema_fixes() -> None:
     assert v1_router.prefix == "/api/v1"
 
 
+#: Routes that legitimately live outside `/api/v1`: story 1's liveness probe,
+#: plus the documentation routes FastAPI mounts itself.
+UNVERSIONED_PATHS = frozenset(
+    {"/health", "/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"}
+)
+
+
+def _mounted_paths(routes: list, prefix: str = "") -> list[str]:
+    """Every route path actually mounted, reconstructed with its full prefix.
+
+    Since FastAPI 0.141 `include_router` no longer copies routes: it leaves a
+    lazy `_IncludedRouter` marker carrying the sub-router and the prefix it was
+    mounted under. Walking that marker is the only way to see routes attached
+    through a sub-router — and `include_in_schema=False` routes, which never
+    appear in the OpenAPI document at all.
+    """
+    paths: list[str] = []
+    for route in routes:
+        context = getattr(route, "include_context", None)
+        if context is not None:
+            paths.extend(
+                _mounted_paths(context.included_router.routes, prefix + context.prefix)
+            )
+            continue
+        path = getattr(route, "path", None)
+        if path is not None:
+            paths.append(prefix + path)
+    return paths
+
+
 def test_every_v1_route_lives_under_the_prefix() -> None:
-    """Survives stories 5-8 adding routes; an unprefixed one fails here."""
-    for route in v1_router.routes:
-        assert route.path.startswith("/api/v1"), route.path
+    """Survives stories 5-8 adding routes; an unprefixed one fails here.
+
+    Walks the assembled app's routes rather than the OpenAPI document. The
+    document would miss exactly the route most likely to escape scrutiny — one
+    declared `include_in_schema=False` — and would pass vacuously if the paths
+    dict were ever empty. The non-emptiness assertion below closes the second
+    hole; the walk closes the first.
+    """
+    paths = _mounted_paths(create_app().routes)
+
+    assert paths, "walked no routes at all — the walk is broken, not the app"
+    for path in paths:
+        assert path in UNVERSIONED_PATHS or path.startswith("/api/v1"), path
+
+
+def test_the_route_walk_sees_more_than_the_openapi_document(
+    client: TestClient,
+) -> None:
+    """Guards the guard: a walk that silently saw nothing would pass above."""
+    walked = set(_mounted_paths(create_app().routes))
+    documented = set(client.get("/openapi.json").json()["paths"])
+
+    assert documented, "the OpenAPI document has no paths"
+    assert documented <= walked, sorted(documented - walked)
+    assert "/openapi.json" in walked and "/openapi.json" not in documented
 
 
 def test_v1_seam_is_mounted_on_the_built_app() -> None:
@@ -78,6 +131,11 @@ def test_v1_seam_is_mounted_on_the_built_app() -> None:
 
     The seam has no routes of its own yet, so mounting it is invisible in
     `app.routes`. Attach a probe route, build the app, and call it.
+
+    Since story 3 the seam also carries bearer validation, which would answer
+    401 before the probe ran. The dependency is overridden rather than
+    satisfied with a real token: this test is about *mounting*, and
+    `tests/test_auth.py` is where the validation itself is exercised.
     """
     probe = APIRouter()
 
@@ -85,16 +143,19 @@ def test_v1_seam_is_mounted_on_the_built_app() -> None:
     async def _probe() -> dict[str, bool]:
         return {"mounted": True}
 
+    # Snapshot/restore rather than filtering by path: since FastAPI 0.141 an
+    # `include_router` leaves an `_IncludedRouter` marker that carries no
+    # `path`, so a path-based filter would leak the probe into every later
+    # test in the session.
+    saved = list(v1_router.routes)
     v1_router.include_router(probe)
     try:
-        client = TestClient(create_app())
+        application = create_app()
+        application.dependency_overrides[require_claims] = lambda: {"sub": "probe"}
+        client = TestClient(application)
         response = client.get("/api/v1/__mount_probe__")
     finally:
-        v1_router.routes[:] = [
-            route
-            for route in v1_router.routes
-            if getattr(route, "path", "") != "/api/v1/__mount_probe__"
-        ]
+        v1_router.routes[:] = saved
 
     assert response.status_code == 200
     assert response.json() == {"mounted": True}

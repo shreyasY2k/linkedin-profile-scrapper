@@ -19,6 +19,10 @@ import os
 REQUIRED_ENV = {
     "DATABASE_URL": "postgresql://test:test@localhost:5432/test",
     "KEYCLOAK_SERVER_URL": "http://localhost:8080",
+    # Deliberately different from KEYCLOAK_SERVER_URL: the suite must fail if
+    # the issuer is ever derived from the in-network address, which is the bug
+    # that would make every deployed token look foreign.
+    "KEYCLOAK_ISSUER_URL": "https://issuer.example.test",
     "KEYCLOAK_REALM": "test-realm",
     "KEYCLOAK_CLIENT_ID": "test-client",
     "KEYCLOAK_CLIENT_SECRET": "test-client-secret",

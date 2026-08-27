@@ -47,9 +47,11 @@ USER root
 COPY requirements-dev.txt ./
 RUN pip install --no-cache-dir -r requirements-dev.txt
 COPY --chown=app:app tests ./tests
-# Dummy values only. The contract tests read both files to prove .env.example
-# documents every Settings field and every ${VAR} compose interpolates.
+# Dummy values only. The contract tests read these to prove .env.example
+# documents every Settings field and every ${VAR} compose interpolates, and
+# that the committed realm export agrees with both and carries no secret.
 COPY --chown=app:app .env.example docker-compose.yml ./
+COPY --chown=app:app deploy/keycloak ./deploy/keycloak
 USER app
 # no:cacheprovider — /srv is root-owned and pytest's cache is worthless here.
 CMD ["pytest", "-q", "-p", "no:cacheprovider"]

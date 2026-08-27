@@ -42,7 +42,27 @@ services:
     # `start`, never `start-dev`: start-dev has insecure defaults and would make
     # local differ from deployed by command rather than by env. Plain `start`
     # does an implicit build at boot, so the stock image is enough.
-    command: ["start"]
+    #
+    # `--import-realm` reads every *.json under /opt/keycloak/data/import at
+    # boot. The import strategy is IGNORE_EXISTING, so this is idempotent: the
+    # realm is created on a cold volume and left alone on every later start.
+    # Consequence worth knowing: editing KEYCLOAK_CLIENT_SECRET in .env after
+    # the first boot does NOT reach an already-imported realm. Rotate it in the
+    # admin console, or `docker compose down -v` and come back up.
+    command: ["start", "--import-realm"]
+    volumes:
+      # The DIRECTORY, read-only — not the single file inside it. A bind mount
+      # whose source file is missing or renamed makes Docker helpfully create
+      # an empty DIRECTORY at that path; Keycloak then imports a directory as
+      # a realm file, finds nothing, and boots healthy with no realm at all,
+      # rejecting every token with nothing in the logs to explain it. Mounting
+      # the directory removes that failure mode: the source exists in the
+      # repository, and `--import-realm` reads every *.json inside it.
+      #
+      # The export carries no secret — the ${KEYCLOAK_CLIENT_SECRET},
+      # ${KEYCLOAK_REALM} and ${KEYCLOAK_CLIENT_ID} placeholders inside it are
+      # substituted by Keycloak's importer from the container environment.
+      - ./deploy/keycloak:/opt/keycloak/data/import:ro
     environment:
       # KEYCLOAK_ADMIN/_PASSWORD are deprecated since 26.0 and silently ignored;
       # using them leaves the container with no admin at all.
@@ -62,6 +82,18 @@ services:
       KC_HTTP_ENABLED: "true"
       KC_HOSTNAME_STRICT: "false"
       KC_PROXY_HEADERS: xforwarded
+      # Consumed ONLY by the realm import above, which substitutes ${VAR} from
+      # the container environment. Keycloak ignores non-KC_ variables otherwise.
+      #
+      # KEYCLOAK_CLIENT_SECRET is what keeps the committed export secret-free.
+      # KEYCLOAK_REALM and KEYCLOAK_CLIENT_ID are here for the same reason
+      # DATABASE_URL is composed from the POSTGRES_* parts in story 1: .env is
+      # the single source of truth. Hardcoding them in the export would let a
+      # .env edit produce a stack that boots green and 401s every token,
+      # because the realm the API asks for would not be the realm that exists.
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:?KEYCLOAK_CLIENT_SECRET is required — cp .env.example .env}
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:?KEYCLOAK_REALM is required — cp .env.example .env}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:?KEYCLOAK_CLIENT_ID is required — cp .env.example .env}
     # Keycloak sizes its heap as a percentage of the container limit. With no
     # limit it claims ~70% of the host.
     mem_limit: 1g
