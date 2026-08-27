@@ -2,7 +2,8 @@
 title: 'Voyager client returning raw profile JSON'
 type: 'feature'
 created: '2026-08-27'
-status: 'draft'
+status: 'in-progress'
+baseline_commit: '7b36c08d9523ce9266434cb105d25450a7d99a7b'
 review_loop_iteration: 0
 context:
   - '{project-root}/_bmad-output/specs/spec-linkedin-profile-scraper/SPEC.md'

@@ -10,13 +10,13 @@ The instance holds **no public IP**. The load balancer is the only public path, 
 flowchart LR
     EV["Evaluator<br/><code>curl</code>"]
 
-    subgraph Edge["Public edge"]
-        CF["Cloudflare<br/>proxied · Full (strict)"]
-        LB["OCI Load Balancer<br/>public subnet"]
+    subgraph Edge["Public edge — TLS lives here"]
+        CF["Cloudflare<br/>proxied"]
+        LB["OCI Load Balancer<br/>terminates TLS · holds the certificate"]
     end
 
-    subgraph Host["Oracle A1 Flex · Ubuntu 24.04 · arm64 · 10.0.1.173/24 (private)"]
-        NGX["host nginx 1.24<br/>Cloudflare Origin Certificate"]
+    subgraph Host["Oracle A1 Flex · Ubuntu 24.04 · arm64 · 10.0.1.173/24 (private, no public IP)"]
+        NGX["host nginx 1.24<br/>port 80 only · no certificate"]
 
         subgraph DC["docker compose — one command"]
             API["FastAPI<br/>127.0.0.1:8000"]
@@ -27,18 +27,18 @@ flowchart LR
 
     LI["LinkedIn Voyager API"]
 
-    EV -->|HTTPS| CF --> LB -->|":443"| NGX
+    EV -->|HTTPS| CF -->|HTTPS| LB -->|"HTTP :80 (inside the VCN)"| NGX
+    NGX -->|"location = / → /health"| API
     NGX -->|"location /"| API
     NGX -->|"location /realms/"| KC
     API --> PG
     KC --> PG
     API -->|"li_at session"| LI
-
-    classDef pending stroke-dasharray: 5 5
-    class CF,LB pending
 ```
 
-Dashed nodes are **not yet wired**. `shreyaskaushik.dpdns.org` resolves to Cloudflare nameservers but has no A record, and host `iptables` still rejects 80/443 — both are deliberate manual steps, documented in [`deploy/README.md`](../deploy/README.md).
+**TLS terminates at the load balancer**, which holds the certificate. nginx therefore holds none and listens on port 80 only — and host `iptables` opens 80 and *not* 443, which matches exactly. The one plaintext hop is load balancer → instance, inside the OCI VCN rather than across the public internet.
+
+This is why nginx must **not** redirect to HTTPS: it sees `http` on a request the client made over HTTPS, so a scheme-based redirect loops forever. Cloudflare handles `http://` → `https://` at the edge.
 
 `/admin/` is intentionally **not** proxied. The Keycloak admin console is reachable only over an SSH tunnel.
 
@@ -154,7 +154,7 @@ Auth attaches to the **router**, not to individual routes, so a later route inhe
 | # | Story | State |
 |---|---|---|
 | 1 | Skeleton, env config, local parity | Done |
-| 2 | Deploy through LB and nginx | Host prep partial — firewall, LB, DNS, cert outstanding |
+| 2 | Deploy through LB and nginx | **Done** — live at https://shreyaskaushik.dpdns.org |
 | 3 | Keycloak realm, clients, JWT validation | Done |
 | 4 | Voyager client, raw JSON | In progress |
 | 5 | Encrypted per-user session vault | Pending |
@@ -171,5 +171,6 @@ Auth attaches to the **router**, not to individual routes, so a later route inhe
 | Voyager JSON, never rendered HTML | HTML is authwalled and truncated for datacenter IPs; the API is the literal task |
 | Stale-serve unbounded — no TTL, no eviction | The service is graded on still answering. A record of any age beats an error |
 | Keycloak `start`, never `start-dev` | Local and deployed must differ by env alone, never by command |
-| Cloudflare Full (strict), not Flexible | Flexible leaves `li_at` cookies in plaintext between Cloudflare and the origin |
+| TLS terminates at the load balancer | Cloudflare→LB is encrypted; the only plaintext hop is LB→instance inside the private VCN, never the public internet |
+| Load-balancer health check probes `GET /`, proxied to `/health` | The check must be *truthful*: 200 only while the API really answers. A static 200 would report a dead backend as healthy |
 | 428 for missing/expired session | The caller has a fixable missing precondition, which is exactly what 428 means |

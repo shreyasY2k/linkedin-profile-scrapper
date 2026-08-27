@@ -95,3 +95,7 @@
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/3-keycloak-realm-and-jwt-validation.md`
   summary: Every rejected request logs at WARNING, so an unauthenticated flood is also a log flood.
   evidence: Acceptable for an evaluation service and it is the only debuggability channel the single-message 401 leaves. If rate limiting is ever built (Should tier), the rejection log should be sampled or moved behind it.
+
+- source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/2-walking-skeleton-deploy.md`
+  summary: An unauthenticated caller can enumerate which /api/v1 paths exist, because a non-existent path returns 404 while a real one returns 401.
+  evidence: Verified on the deployed host - GET /api/v1/x without a token returns 404 NOT_FOUND, since FastAPI resolves routing before router-level dependencies run. No data is exposed, but it distinguishes real routes from absent ones. Story 8 could normalise unmatched /api/v1 paths to 401.

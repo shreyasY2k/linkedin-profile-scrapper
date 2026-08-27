@@ -2,7 +2,7 @@
 title: 'Walking-skeleton deploy through the load balancer and nginx'
 type: 'feature'
 created: '2026-08-27'
-status: 'in-progress'
+status: 'done'
 baseline_commit: '6f67e1b'
 review_loop_iteration: 0
 context:
@@ -67,15 +67,15 @@ Verified on the instance this session — several SPEC statements were wrong and
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] host — install Docker Engine + compose plugin from Docker's official arm64 repo; enable the unit — the stack cannot run otherwise
-- [ ] host — install nginx and enable the unit — the sole public listener
-- [ ] host — insert ACCEPT rules for 80/443 **above** the trailing REJECT, then persist via `iptables-persistent` — survives reboot
-- [ ] host — clone the repo and write `.env` with real values, never echoed into shell history — same compose file as local
-- [ ] `deploy/nginx/linkedin-profile-api.conf` — commit the site config: `server_name`, `proxy_pass` to `127.0.0.1:8000`, `X-Forwarded-*`, HTTP→HTTPS redirect — the one deployment-time wiring step, kept reproducible in the repo
-- [ ] host — install the Origin Certificate and key under `/etc/ssl/`, key at 0600 root-owned
-- [ ] host — `docker compose up -d --wait` on the instance
-- [ ] `deploy/README.md` — record the exact steps performed, so story 9 can describe the deployment truthfully
-- [ ] verify — from this machine, off the instance network, over the public name
+- [x] host — install Docker Engine + compose plugin from Docker's official arm64 repo; enable the unit — the stack cannot run otherwise
+- [x] host — install nginx and enable the unit — the sole public listener
+- [x] host — insert ACCEPT rules for 80/443 **above** the trailing REJECT, then persist via `iptables-persistent` — survives reboot
+- [x] host — clone the repo and write `.env` with real values, never echoed into shell history — same compose file as local
+- [x] `deploy/nginx/linkedin-profile-api.conf` — commit the site config: `server_name`, `proxy_pass` to `127.0.0.1:8000`, `X-Forwarded-*`, HTTP→HTTPS redirect — the one deployment-time wiring step, kept reproducible in the repo
+- [x] host — install the Origin Certificate and key under `/etc/ssl/`, key at 0600 root-owned
+- [x] host — `docker compose up -d --wait` on the instance
+- [x] `deploy/README.md` — record the exact steps performed, so story 9 can describe the deployment truthfully
+- [x] verify — from this machine, off the instance network, over the public name
 
 **Acceptance Criteria:**
 - Given a machine outside the instance's network, when it requests `https://shreyaskaushik.dpdns.org/health`, then it receives `200 {"status":"ok"}` over a valid chain.
@@ -99,6 +99,16 @@ Findings recorded for the resumed run:
 - **The GitHub repository is private** (unauthenticated API returns 404), so `git clone` on the instance fails and SPEC's public-repository requirement is unmet. Make it public rather than placing a credential on the host.
 - **`netfilter-persistent save` captures Docker's chains too.** Harmless, but it makes the post-reboot verification mandatory rather than optional.
 - Docker was installed as `docker-ce`, replacing an in-flight `docker.io` install found on the host; `docker.io` ships no compose plugin. `docker.socket` had to be enabled before `dockerd` would start.
+
+**2026-08-27 — RESUMED and completed. TLS terminates at the load balancer, not nginx.**
+
+The human configured Cloudflare, the load balancer and the certificate, then re-authorised SSH and added the instance's key to GitHub. That changed the design on record: the load balancer holds the certificate and speaks **plain HTTP to nginx on port 80**. Host iptables opens 80 and not 443, which matches.
+
+The committed nginx config was therefore wrong in two ways and would have broken the site: it listened on 443 with an origin certificate on a port the firewall does not open, and it 301-redirected port 80 to HTTPS — a redirect that loops forever, because nginx sees `http` on a request the client made over HTTPS. Rewritten for termination at the load balancer.
+
+**The load-balancer health check was the real trap, and it fired.** With nginx's default site the probe got the welcome page's 200 and the backend was healthy. Installing the real site made `GET /` proxy to the API, which 404s — the backend went unhealthy and every public request became a 502 while nginx, Docker and the API were all fine. The access log named it exactly: `10.0.0.60 "GET / HTTP/1.1" 404`. Fixed with an exact-match `location = /` proxying to the API's `/health`, so the check stays truthful rather than returning a static 200 that would report a dead backend as healthy.
+
+Verified live from outside the network: `/health` 200, both graded curl commands work over the public name, the minted token carries `iss: https://shreyaskaushik.dpdns.org/realms/linkedin`, only nginx listens off-loopback, docker/nginx/containerd all enabled, containers `unless-stopped`, and the port-80 ACCEPT is in the saved `rules.v4` so it survives a reboot.
 
 ## Design Notes
 
