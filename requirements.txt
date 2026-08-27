@@ -1,0 +1,6 @@
+# Runtime dependencies. Pinned exactly, no lockfile tool — boring on purpose.
+# Verified 2026-08-27 against arm64 wheel coverage on PyPI.
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+pydantic==2.13.4
+pydantic-settings==2.15.0

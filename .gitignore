@@ -1,0 +1,39 @@
+# --- Secrets: never tracked, from the first commit onward ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.crt
+secrets/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Editors / OS ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# --- Local agent/tooling installs (not project source) ---
+# _bmad/ also carries a manifest whose file checksums trip gitleaks' generic
+# API-key rule. _bmad-output/ (the spec and planning artifacts) is deliberately
+# NOT ignored: whether the public repo carries it is the author's call.
+.claude/
+_bmad/
+_bmad-output/**/tmp/

@@ -1,0 +1,6 @@
+# Test-only dependencies. Never installed into the runtime image layer that
+# ships; kept separate so the runtime surface stays exactly requirements.txt.
+-r requirements.txt
+pytest==9.1.1
+# starlette's TestClient wants httpx2; plain httpx still works but deprecates.
+httpx2==2.12.0
