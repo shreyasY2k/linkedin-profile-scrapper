@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import os
 
-#: The complete env surface ``Settings`` reads. Kept here rather than imported
-#: from the app so that a field added to ``Settings`` without a matching entry
-#: in ``.env.example`` shows up as a test failure.
+#: The complete env surface ``Settings`` reads.
+#:
+#: Values are assigned unconditionally, never via ``setdefault``: a developer
+#: with a real ``DATABASE_URL`` or ``KEYCLOAK_*`` exported in their shell would
+#: otherwise have it silently win, and the suite would quietly be exercising
+#: their live configuration instead of these fixtures.
 REQUIRED_ENV = {
     "DATABASE_URL": "postgresql://test:test@localhost:5432/test",
     "KEYCLOAK_SERVER_URL": "http://localhost:8080",
@@ -23,4 +26,19 @@ REQUIRED_ENV = {
 }
 
 for _name, _value in REQUIRED_ENV.items():
-    os.environ.setdefault(_name, _value)
+    os.environ[_name] = _value
+
+
+# Import only after the environment is complete.
+from app.config import Settings  # noqa: E402
+
+# A field added to `Settings` without a matching REQUIRED_ENV entry would lose
+# every missing/blank-variable assertion below without failing anything. Assert
+# the two stay in lockstep at collection time, where it cannot be missed.
+_declared = set(Settings.model_fields)
+_covered = {name.lower() for name in REQUIRED_ENV}
+assert _covered == _declared, (
+    "REQUIRED_ENV is out of sync with Settings: "
+    f"missing from REQUIRED_ENV={sorted(_declared - _covered)}, "
+    f"stale in REQUIRED_ENV={sorted(_covered - _declared)}"
+)

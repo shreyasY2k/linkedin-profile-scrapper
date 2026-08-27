@@ -66,6 +66,13 @@ replace at minimum:
 - `KEYCLOAK_CLIENT_SECRET`
 - `SESSION_ENCRYPTION_KEY`
 
+You do **not** need to re-edit `DATABASE_URL` after changing `POSTGRES_PASSWORD`.
+`POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` are the single source of
+truth: the `api` service composes `DATABASE_URL` from those three and injects it
+as a compose-level `environment` entry, which overrides the `DATABASE_URL` line
+in `.env`. That line matters only if you run the app outside compose. (If your
+password contains `@ : / ? #`, percent-encode it in the compose expression.)
+
 Every variable `Settings` declares is **required and non-empty**, including the
 ones no code reads yet. A deployment missing `SESSION_ENCRYPTION_KEY` dies at
 boot with that field named on stderr, rather than at the first request that

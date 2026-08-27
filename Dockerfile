@@ -18,8 +18,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN groupadd --gid 10001 app \
  && useradd --uid 10001 --gid 10001 --no-log-init --create-home app
 
+# Application source only. Test sources are added in the `test` stage below, so
+# they never reach the image that ships.
 COPY --chown=app:app app ./app
-COPY --chown=app:app tests ./tests
 
 USER app
 
@@ -27,18 +28,28 @@ EXPOSE 8000
 
 # uvicorn imports app.main, which imports app.config: a missing or blank
 # required variable aborts here, non-zero, naming the field.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+#
+# --proxy-headers / --forwarded-allow-ips: story 2 puts host nginx in front,
+# terminating TLS. Without these the app reads the proxy's IP as the client and
+# builds http:// URLs for an https:// request. Keycloak's equivalent is
+# KC_PROXY_HEADERS; this is the API's. The allow-list is "*" because the only
+# thing that can reach this container is host nginx over the compose network —
+# the published port binds 127.0.0.1, so no untrusted client can forge headers.
+CMD ["uvicorn", "app.main:app", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--proxy-headers", "--forwarded-allow-ips", "*"]
 
 
-# Test image. Built only on demand (`docker compose build --build-arg` is not
-# needed — use `docker build --target test .`), so pytest and httpx never enter
-# the image that ships.
+# Test image. Built only on demand (`docker build --target test .`), so pytest,
+# httpx2 and the test sources never enter the image that ships.
 FROM base AS test
 USER root
 COPY requirements-dev.txt ./
 RUN pip install --no-cache-dir -r requirements-dev.txt
-# Dummy values only; lets tests assert .env.example covers every Settings field.
-COPY .env.example ./
+COPY --chown=app:app tests ./tests
+# Dummy values only. The contract tests read both files to prove .env.example
+# documents every Settings field and every ${VAR} compose interpolates.
+COPY --chown=app:app .env.example docker-compose.yml ./
 USER app
 # no:cacheprovider — /srv is root-owned and pytest's cache is worthless here.
 CMD ["pytest", "-q", "-p", "no:cacheprovider"]

@@ -16,7 +16,10 @@ from fastapi import FastAPI
 from app import __version__
 from app.api import health
 from app.api import v1
-from app.config import settings
+# Imported for its side effect and re-exported for callers: `Settings()` runs at
+# app.config module scope, so an incomplete environment has already raised by
+# the time this line returns. Do not "clean up" as unused.
+from app.config import settings as settings  # noqa: F401
 
 API_TITLE = "LinkedIn Profile API"
 API_DESCRIPTION = (
@@ -27,10 +30,6 @@ API_DESCRIPTION = (
 
 def create_app() -> FastAPI:
     """Build the ASGI application with every router mounted."""
-    # Touch the settings object so a broken environment is a boot failure with
-    # a clear traceback rather than a surprise on the first request.
-    _ = settings.keycloak_realm
-
     application = FastAPI(
         title=API_TITLE,
         description=API_DESCRIPTION,

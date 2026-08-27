@@ -11,6 +11,8 @@ for the API container to be restarted.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from fastapi import APIRouter
 from pydantic import BaseModel
 
@@ -18,9 +20,13 @@ router = APIRouter(tags=["operations"])
 
 
 class HealthResponse(BaseModel):
-    """Body of a successful liveness probe."""
+    """Body of a successful liveness probe.
 
-    status: str
+    ``status`` is a Literal, not an open string, so the OpenAPI document story 9
+    ships states the only legal value rather than promising "some string".
+    """
+
+    status: Literal["ok"]
 
 
 @router.get("/health", response_model=HealthResponse, summary="Liveness probe")

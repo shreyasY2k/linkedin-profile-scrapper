@@ -24,9 +24,13 @@ services:
     ports:
       - "127.0.0.1:5432:5432"
     healthcheck:
-      # Both flags matter: bare `pg_isready` reports green during init while
-      # only a local socket is up, and Keycloak then fails to connect.
-      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      # -h 127.0.0.1 is what makes this honest: during initdb the entrypoint
+      # runs a temporary server on the unix socket only, so a socket-based
+      # pg_isready reports green while nothing can actually connect over TCP.
+      # -U/-d pin the check to the role and database Keycloak and the API use.
+      test:
+        - CMD-SHELL
+        - "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""
       interval: 5s
       timeout: 5s
       retries: 30
@@ -45,9 +49,12 @@ services:
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USERNAME:?KEYCLOAK_ADMIN_USERNAME is required}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?KEYCLOAK_ADMIN_PASSWORD is required}
       KC_DB: postgres
-      KC_DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
-      KC_DB_USERNAME: ${POSTGRES_USER}
-      KC_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      # Guarded like the postgres service: without :? a blank POSTGRES_DB
+      # would let Keycloak start against the wrong database instead of failing
+      # with a message that names the variable.
+      KC_DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required — cp .env.example .env}
+      KC_DB_USERNAME: ${POSTGRES_USER:?POSTGRES_USER is required — cp .env.example .env}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — cp .env.example .env}
       # Health endpoints live on the management port (9000) and are off unless
       # this is set.
       KC_HEALTH_ENABLED: "true"
@@ -81,6 +88,14 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      # POSTGRES_* is the single source of truth for these credentials, and
+      # `environment` overrides `env_file`, so editing POSTGRES_PASSWORD in
+      # .env cannot leave the API holding a stale password encoded separately
+      # in DATABASE_URL. /health checks no dependencies, so such a mismatch
+      # would otherwise stay green until story 3 opened the first connection.
+      # A password containing @ : / ? # would need percent-encoding here.
+      DATABASE_URL: postgresql://${POSTGRES_USER:?POSTGRES_USER is required — cp .env.example .env}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — cp .env.example .env}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required — cp .env.example .env}
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
