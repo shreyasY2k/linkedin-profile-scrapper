@@ -232,9 +232,24 @@ class SessionResponse(BaseModel):
 #: that will not decrypt (or is bound to another subject) on `GET`.
 SESSION_ERRORS: dict[int | str, dict[str, Any]] = {
     **error_responses("NO_SESSION", "SESSION_EXPIRED"),
+    # Not taxonomy rows — see `app/errors.py`. Documented for the same reason
+    # the profile route documents them: a status a route can answer and does not
+    # document is a status a client will meet by surprise.
+    #
+    # 422 in particular has to be stated HERE rather than left to FastAPI. `PUT`
+    # takes a request body, so FastAPI generates a 422 of its own referencing
+    # `HTTPValidationError` — which is the one shape this API never returns.
+    # The handler converts it to the typed envelope at runtime, so an
+    # undeclared 422 leaves the published document contradicting the wire.
+    422: {
+        "model": ErrorEnvelope,
+        "description": (
+            "`INVALID_REQUEST` — the body is not `{\"li_at\": \"…\"}`: a missing "
+            "or non-string `li_at`, or an unexpected field."
+        ),
+    },
     # Not a taxonomy code — `response-schema.md` has no row for this API's own
-    # datastore being down. Documented anyway, because a status a route can
-    # answer and does not document is a status a client will meet by surprise.
+    # datastore being down.
     503: {
         "model": ErrorEnvelope,
         "description": "`SERVICE_UNAVAILABLE` — the session store could not be reached.",
