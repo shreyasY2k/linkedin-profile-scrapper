@@ -128,6 +128,16 @@ services:
       # would otherwise stay green until story 3 opened the first connection.
       # A password containing @ : / ? # would need percent-encoding here.
       DATABASE_URL: postgresql://${POSTGRES_USER:?POSTGRES_USER is required — cp .env.example .env}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — cp .env.example .env}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required — cp .env.example .env}
+      # Blanked, deliberately, and this line is load-bearing. `env_file` loads
+      # the WHOLE of .env into this container, so a developer who filled in
+      # LINKEDIN_DEV_COOKIE to run the live check would otherwise be shipping
+      # their live LinkedIn session into the running service's environment —
+      # readable via `docker inspect` and /proc/1/environ, and captured by
+      # anything that dumps the environment on a crash. The service has no use
+      # for it: callers supply their own session at runtime, and the live check
+      # runs on the host, not in this container. `environment` overrides
+      # `env_file`, and app/config.py treats blank as absent.
+      LINKEDIN_DEV_COOKIE: ""
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:

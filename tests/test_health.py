@@ -288,6 +288,95 @@ def test_settings_accepts_a_complete_environment(
     assert settings.keycloak_realm == REQUIRED_ENV["KEYCLOAK_REALM"]
 
 
+# --- The one optional field -------------------------------------------------
+#
+# `LINKEDIN_DEV_COOKIE` is the single exception to "every variable is required
+# and non-blank", so it needs its own coverage: the required-variable tests
+# above deliberately exclude it, which leaves it with none.
+
+
+def test_the_developer_cookie_round_trips_through_get_secret_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without this, a validator that returned None unconditionally would pass
+    every other test in the suite — and silently make the live check inert.
+
+    The only visible symptom would be `skipped` where `passed` used to be, on a
+    test that is skipped by default anyway. The one assertion that catches it
+    is that a set value survives being read back.
+    """
+    for name, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("LINKEDIN_DEV_COOKIE", "a-value-that-must-survive")
+
+    cookie = Settings(_env_file=None).linkedin_dev_cookie
+
+    assert cookie is not None
+    assert cookie.get_secret_value() == "a-value-that-must-survive"
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t", "\n  \n"])
+def test_a_blank_developer_cookie_is_absent_not_empty(
+    monkeypatch: pytest.MonkeyPatch, blank: str
+) -> None:
+    """`.env.example` ships the variable ASSIGNED but empty, because the env
+    contract test skips comment lines. Read literally that is `SecretStr("")` —
+    a "configured" session whose value is worthless, and a live check that
+    spends a real request proving it."""
+    for name, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("LINKEDIN_DEV_COOKIE", blank)
+
+    assert Settings(_env_file=None).linkedin_dev_cookie is None
+
+
+def test_an_unset_developer_cookie_is_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("LINKEDIN_DEV_COOKIE", raising=False)
+
+    assert Settings(_env_file=None).linkedin_dev_cookie is None
+
+
+def test_the_developer_cookie_is_not_rendered_by_repr_or_dump(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Settings is imported at boot and can appear in a traceback or a debug dump."""
+    for name, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("LINKEDIN_DEV_COOKIE", "must-never-be-printed")
+
+    settings = Settings(_env_file=None)
+
+    assert "must-never-be-printed" not in repr(settings)
+    assert "must-never-be-printed" not in str(settings)
+    assert "must-never-be-printed" not in str(settings.model_dump())
+
+
+def test_only_the_developer_cookie_is_optional() -> None:
+    """Every optional field weakens the fail-at-boot contract story 1 set."""
+    optional = {n for n, f in Settings.model_fields.items() if not f.is_required()}
+
+    assert optional == {"linkedin_dev_cookie"}
+
+
+def test_compose_keeps_the_developer_cookie_out_of_the_api_container() -> None:
+    """`env_file: .env` loads the WHOLE file into the container.
+
+    A developer who filled the cookie in to run the live check would otherwise
+    be shipping their live LinkedIn session into the running service's
+    environment — readable through `docker inspect` and /proc/1/environ — which
+    is the opposite of what `.env.example` and `app/config.py` both promise.
+    """
+    compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    api_block = compose.split("\n  api:", 1)[1]
+
+    assert 'LINKEDIN_DEV_COOKIE: ""' in api_block, (
+        "the api service must override LINKEDIN_DEV_COOKIE to blank; "
+        "`environment` beats `env_file`"
+    )
+
+
 def test_settings_has_no_environment_name_to_branch_on() -> None:
     """No APP_ENV, by design: nothing can branch on an environment name."""
     fields = set(Settings.model_fields)

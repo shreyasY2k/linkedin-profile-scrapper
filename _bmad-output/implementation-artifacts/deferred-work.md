@@ -105,8 +105,8 @@
   evidence: The live check fetches only the session owner, by design (every fetch spends real quota against a real account, and a third party's profile is not the author's data to spend). Profiles with no certifications, a hidden headline, or a non-en_US primary locale may carry shapes no fixture mirrors. Story 6's mapper must therefore treat every field as optional rather than trusting the measured shape table.
 
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
-  summary: A section failing with SESSION_EXPIRED or RATE_LIMITED degrades to a partial profile rather than failing the whole fetch.
-  evidence: The Design Notes say a section that errors should degrade and only a core failure should abort, and that is what is implemented. But those two codes are systemic, not per-section: if languages is throttled the others probably were too, and answering 200-with-partial is arguably less honest than answering 429. The client records the code per section so story 6/8 can decide; they should decide deliberately rather than inherit this.
+  summary: RESOLVED in review pass 1 — a section failing with SESSION_EXPIRED, RATE_LIMITED or UPSTREAM_CHALLENGE now aborts the fetch rather than degrading to a partial profile.
+  evidence: All three are account-wide by construction, so a partial 200 would be a wrong answer that story 7 then caches. `SYSTEMIC_CODES` in app/linkedin/client.py holds the set and a test pins it. Per-section failures (404, malformed envelope, unexpected status) still degrade, per the Design Notes.
 
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
   summary: Section pagination is not followed — a profile with more than 100 entries in one section is still silently truncated.
@@ -122,9 +122,30 @@
 
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
   summary: The type alias in `app/config.py` is named `OptionalSecretSetting` specifically so gitleaks' `linkedin-client-id` rule does not fire on the field declaration.
-  evidence: That rule matches `linkedin` followed by a 14-16 character token, so `linkedin_dev_cookie: OptionalSecret = Field(` reads as a leaked credential and the pre-commit hook refuses the commit. Documented at the alias. A `.gitleaksignore` or an allowlist rule would be the honest fix; naming around a scanner is a trap for whoever renames it next.
+  evidence: That rule matches the word linkedin followed within a few characters by a 14-16 character token, which is what the field declaration looks like when the alias name is that length. The pre-commit hook then refuses the commit over a type annotation. Documented at the alias itself. A `.gitleaksignore` entry or an allowlist rule would be the honest fix; naming around a scanner is a trap for whoever renames it next. (This note is worded to avoid reproducing the pattern, which tripped the scanner a second time.)
 
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
   summary: A challenge is detected by final URL and content type, so a challenge served as valid JSON at the requested URL would be read as data.
   evidence: LinkedIn has no reason to do this today and both observed challenge forms (redirect to /authwall, HTML in place) are caught. Adding a body-shape check — "a 200 that parses but carries neither `data` nor `included`" — would close it, at the cost of guessing about payloads that were never observed.
+
+
+- source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/5-encrypted-session-vault.md`
+  summary: No migration tool - schema is created by an idempotent bootstrap at startup, so there is no migration history and no down-path.
+  evidence: Deliberate decision by the author on 2026-08-27: migrations are on hold until the APIs are completely built, then introduced. Revisit once stories 6-8 have settled the schema, before any change that would need to alter an existing column rather than create a table.
+
+- source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
+  summary: The core lookup refuses to answer when the returned `publicIdentifier` differs from the one requested, which would also refuse a profile answering under a changed vanity URL.
+  evidence: Deliberate fail-closed choice, added in review pass 1. `memberIdentity` is an exact lookup and a mismatch is far more likely to be a mix-up than a legitimate alias, and serving one person's profile under another's URL — then caching it unboundedly — is the worst failure available here. If a real profile is ever seen to answer under an old id, the alternative is to keep the structural `*elements` resolution and downgrade the identifier mismatch to a logged warning.
+
+- source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
+  summary: A section returning exactly SECTION_PAGE_SIZE elements with no `paging.total` is reported as truncated, which will occasionally be a false positive.
+  evidence: A precisely-full page is what truncation looks like when the total is not reported, and the two errors are not symmetric: the false positive costs a caller an unnecessary caveat, while the false negative publishes a partial career as a complete one. Story 6 should word the `partial[]` entry as "may be incomplete" rather than asserting truncation.
+
+- source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
+  summary: The redirect guard trusts the hostname urllib reports, and pins nothing about TLS or the resolved IP.
+  evidence: Sufficient against the credential-forwarding bug it was written for (verified: urllib forwards a manually-set Cookie header across hosts). It is not a defence against DNS takeover of a linkedin.com subdomain or a compromised CA. Out of scope for an evaluation service; worth knowing before this pattern is reused.
+
+- source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
+  summary: `LINKEDIN_DEV_COOKIE` is blanked for the api container in compose, but nothing stops a future service definition from re-inheriting it through `env_file`.
+  evidence: A test asserts the api service carries the blanking override. Any new container that mounts `.env` wholesale needs the same line, and nothing enforces that for a service that does not exist yet.
 

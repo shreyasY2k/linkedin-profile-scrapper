@@ -24,10 +24,15 @@ trusting it.
 from __future__ import annotations
 
 import asyncio
+import email.message
+import io
 import json
 import logging
 import threading
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -38,6 +43,8 @@ from app.linkedin import client as voyager
 from app.linkedin.client import (
     CORE_RESOURCE,
     SECTION_RESOURCES,
+    CrossHostRedirect,
+    LinkedInRedirectHandler,
     LinkedInSession,
     RawProfile,
     TransportError,
@@ -45,6 +52,7 @@ from app.linkedin.client import (
     VoyagerResponse,
     parse_profile_url,
     resolve_elements,
+    urllib_transport,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -205,6 +213,39 @@ def test_a_known_profile_returns_the_core_entity_and_all_five_sections() -> None
     assert set(profile.sections) == set(SECTION_RESOURCES)
     assert all(section.ok for section in profile.sections.values())
     assert profile.failed_sections == []
+
+
+def test_fetched_at_is_timezone_aware_utc() -> None:
+    """Under unbounded stale-serve this is the caller's ONLY staleness signal.
+
+    A naive datetime serialises with no offset and silently becomes "some local
+    time" to whoever reads it — which, for the one value that makes a
+    months-old cached record actionable, is not a rounding error.
+    """
+    profile = fetch(make_client())
+
+    assert profile.fetched_at.tzinfo is not None
+    assert profile.fetched_at.utcoffset() == timedelta(0)
+
+
+def test_fetched_at_is_stamped_when_the_data_was_read() -> None:
+    """Not when the last of six concurrent calls happened to finish."""
+    slow = threading.Event()
+
+    def slow_section(url: str, headers: dict[str, str]) -> VoyagerResponse:
+        slow.wait(timeout=5)
+        return json_response(load_fixture("voyager_languages.json"))
+
+    routes = override("languages", slow_section)
+    threading.Timer(0.35, slow.set).start()
+
+    before = datetime.now(timezone.utc)
+    profile = fetch(make_client(routes))
+    after = datetime.now(timezone.utc)
+
+    assert (after - before).total_seconds() >= 0.3, "the section really was slow"
+    # Stamped at the core read, so it is nearer the start than the end.
+    assert (profile.fetched_at - before).total_seconds() < 0.3
 
 
 def test_the_payloads_are_returned_raw_and_unmodified() -> None:
@@ -482,6 +523,58 @@ def test_a_total_that_is_not_stated_is_none_not_zero() -> None:
     assert voyager.reported_total(load_fixture("voyager_skills.json")) == 3
 
 
+def test_a_malformed_envelope_is_unreadable_not_empty() -> None:
+    """A 200 whose body is not a collection is the absent-versus-unreadable trap.
+
+    Counting zero elements out of it lets story 6 map the section to `[]`,
+    which states that the profile HAS NONE of something that was never read.
+    """
+    for body in ({"data": {}, "included": []}, {"included": []}, {"data": {"*elements": "x"}}):
+        client = make_client(override("languages", json_response(body)))
+
+        languages = fetch(client).sections["languages"]
+
+        assert languages.ok is False, body
+        assert languages.element_count is None, body
+        assert languages.error_code == "UPSTREAM_ERROR", body
+
+
+def test_a_page_that_fills_exactly_is_treated_as_truncated() -> None:
+    """What truncation looks like when `paging.total` is not reported.
+
+    Calling a precisely-full page complete is a coin flip on a real person's
+    history. The wrong guess in this direction costs a caller an unnecessary
+    caveat; the wrong guess in the other publishes a partial career as a whole
+    one.
+    """
+    payload = load_fixture("voyager_skills.json")
+    payload["data"]["paging"].pop("total", None)
+    element = payload["included"][0]
+    payload["data"]["*elements"] = [element["entityUrn"]] * voyager.SECTION_PAGE_SIZE
+    client = make_client(override("skills", json_response(payload)))
+
+    profile = fetch(client)
+
+    assert profile.sections["skills"].reported_total is None
+    assert profile.sections["skills"].element_count == voyager.SECTION_PAGE_SIZE
+    assert profile.truncated_sections == ["skills"]
+
+
+def test_unresolved_elements_are_recorded_not_silently_dropped() -> None:
+    """Entities referenced and not delivered are a shortfall, not an absence."""
+    payload = load_fixture("voyager_skills.json")
+    payload["data"]["*elements"] = [*payload["data"]["*elements"], "urn:li:fsd_skill:missing"]
+    client = make_client(override("skills", json_response(payload)))
+
+    profile = fetch(client)
+    skills = profile.sections["skills"]
+
+    assert skills.ok is True
+    assert skills.element_count == 4
+    assert skills.resolved_count == 3
+    assert profile.unresolved_sections == ["skills"]
+
+
 def test_element_counts_are_read_from_elements_not_from_included() -> None:
     client = make_client()
 
@@ -517,6 +610,41 @@ VALID_URLS = [
 @pytest.mark.parametrize("url,expected", VALID_URLS)
 def test_a_profile_url_yields_its_public_id(url: str, expected: str) -> None:
     assert parse_profile_url(url) == expected
+
+
+def test_the_public_id_is_case_normalised() -> None:
+    """LinkedIn treats public ids case-insensitively; this string is an identity.
+
+    Without normalising, `/in/Ada` and `/in/ada` are two different people to
+    this service: two story-7 cache keys, two six-call fetches of one person,
+    and two `public_id` values in responses describing one profile.
+    """
+    assert parse_profile_url("https://www.linkedin.com/in/Ada-Placeholder") == PUBLIC_ID
+    assert parse_profile_url("https://www.linkedin.com/in/ADA-PLACEHOLDER") == PUBLIC_ID
+
+    casings = {
+        parse_profile_url(f"https://www.linkedin.com/in/{form}")
+        for form in ("ada-placeholder", "Ada-Placeholder", "ADA-Placeholder")
+    }
+    assert len(casings) == 1, "one person must not become several cache keys"
+
+
+def test_a_mixed_case_url_fetches_the_same_profile() -> None:
+    """End to end: the casing must not survive into the request either."""
+    client = make_client()
+
+    profile = fetch(client, "https://www.linkedin.com/in/Ada-Placeholder")
+
+    assert profile.public_id == PUBLIC_ID
+    assert "memberIdentity=ada-placeholder" in client.transport.urls[0]  # type: ignore[attr-defined]
+
+
+def test_a_schemeless_url_whose_fragment_contains_slashes_still_parses() -> None:
+    """The naive "is there a // anywhere" test rejected this as
+    "scheme '' is not http(s)" — an error naming something the caller did not do."""
+    assert parse_profile_url("linkedin.com/in/ada-placeholder#a//b") == PUBLIC_ID
+    assert parse_profile_url("linkedin.com/in/ada-placeholder?next=//x") == PUBLIC_ID
+    assert parse_profile_url("//www.linkedin.com/in/ada-placeholder") == PUBLIC_ID
 
 
 INVALID_URLS = [
@@ -584,6 +712,57 @@ def test_an_absent_cookie_is_no_session_not_session_expired() -> None:
     assert ERROR_SPECS["NO_SESSION"] != ERROR_SPECS["SESSION_EXPIRED"]
 
 
+@pytest.mark.parametrize(
+    "value,reason",
+    [
+        ("has\r\nInjected: yes", "CRLF header injection"),
+        ("has\nnewline", "bare newline"),
+        ("has;semicolon", "breaks out into another cookie"),
+        ('has"quote', "terminates a quoted value"),
+        ("has\x00null", "control character"),
+        ("x" * 5000, "absurd length"),
+    ],
+)
+def test_a_cookie_that_cannot_go_in_a_header_is_rejected_at_construction(
+    value: str, reason: str
+) -> None:
+    """Otherwise `http.client` raises ValueError with the cookie IN the message.
+
+    That ValueError becomes a *retryable* UPSTREAM_ERROR, which story 7 would
+    stale-serve forever — for a cookie that can never work, no matter how many
+    times it is retried. One accurate 428 replaces an unfixable retry loop.
+    """
+    error = expect_api_error(lambda: VoyagerClient(value, transport=FakeTransport([])))
+
+    assert error.code == "SESSION_EXPIRED", reason
+    assert error.spec.retryable is False, reason
+    # And the offending value is not in the reason the operator reads.
+    assert value not in (error.log_detail or ""), reason
+
+
+def test_a_rejected_cookie_never_appears_in_the_rejection() -> None:
+    error = expect_api_error(
+        lambda: VoyagerClient(f"{SENTINEL_COOKIE};evil=1", transport=FakeTransport([]))
+    )
+
+    assert SENTINEL_COOKIE not in str(error)
+    assert SENTINEL_COOKIE not in (error.log_detail or "")
+    assert SENTINEL_COOKIE not in error.to_response().body.decode("utf-8")
+
+
+@pytest.mark.parametrize("value", ["ajax:0\r\nX: y", 'ajax:"0"', "", "  ", "a" * 5000])
+def test_an_unsafe_jsessionid_is_a_loud_bug_not_a_session_error(value: str) -> None:
+    """Same header-safety rules as the cookie, deliberately a different failure.
+
+    The cookie is caller data, so a bad one is a 428 the caller can act on. The
+    CSRF token is a code-level argument with a safe default that no caller
+    supplies — a bad one is a bug in this repository, and dressing it up as a
+    session problem sends whoever debugs it to the wrong place entirely.
+    """
+    with pytest.raises(ValueError):
+        VoyagerClient(SENTINEL_COOKIE, transport=FakeTransport([]), jsessionid=value)
+
+
 @pytest.mark.parametrize("status", [401, 403])
 def test_a_refused_cookie_is_session_expired(status: int) -> None:
     client = make_client(override("core", status_response(status)))
@@ -611,6 +790,34 @@ def test_check_session_returns_the_sessions_own_public_identifier() -> None:
 
     assert asyncio.run(client.check_session()) == PUBLIC_ID
     assert client.call_count == 1
+
+
+def test_check_session_resolves_the_reference_rather_than_scanning() -> None:
+    """The live check's entire safety property rests on this function.
+
+    `me` is normalized: `data` holds a `*miniProfile` REFERENCE and the
+    identifier lives on the entity that reference names. Scanning `included`
+    for the first entity carrying any `publicIdentifier` happens to work when
+    the array holds one entity and silently returns somebody else when it holds
+    more. The fixture puts a decoy first precisely so that "usually the right
+    person" fails here.
+    """
+    payload = load_fixture("voyager_me.json")
+    identifiers = [e["publicIdentifier"] for e in payload["included"]]
+
+    assert identifiers[0] != PUBLIC_ID, "the fixture must not let a first-hit scan pass"
+    assert asyncio.run(make_client().check_session()) == PUBLIC_ID
+
+
+def test_check_session_reports_an_unresolvable_reference_as_expiry() -> None:
+    """A reference naming an entity that is not there resolves to nobody."""
+    payload = load_fixture("voyager_me.json")
+    payload["data"]["*miniProfile"] = "urn:li:fsd_profile:not-in-this-payload"
+    client = make_client([("/api/me", json_response(payload))])
+
+    assert expect_api_error(lambda: asyncio.run(client.check_session())).code == (
+        "SESSION_EXPIRED"
+    )
 
 
 def test_check_session_reports_a_200_that_names_nobody_as_expiry() -> None:
@@ -641,6 +848,47 @@ def test_a_core_response_with_zero_elements_is_profile_not_found() -> None:
     assert error.code == "PROFILE_NOT_FOUND"
     assert error.spec.status_code == 404
     assert error.spec.retryable is False
+
+
+def test_the_core_profile_is_resolved_through_elements_not_scanned_out() -> None:
+    """`included` is an unordered pool that can carry entities the query did not
+    ask about. "The first thing shaped like a Profile" is a coincidence, not an
+    identity — and answering with the wrong human being, then caching it under
+    the requested URL, is the worst thing this system can do.
+    """
+    core = load_fixture("voyager_core.json")
+    decoy = json.loads(json.dumps(core["included"][0]))
+    decoy["entityUrn"] = "urn:li:fsd_profile:SYNTHETIC-someone-else"
+    decoy["publicIdentifier"] = "someone-else"
+    decoy["firstName"] = "Decoy"
+    core["included"] = [decoy, *core["included"]]
+    client = make_client(override("core", json_response(core)))
+
+    profile = fetch(client)
+
+    assert profile.profile_urn == PROFILE_URN
+    assert profile.profile["publicIdentifier"] == PUBLIC_ID
+    assert profile.profile["firstName"] != "Decoy"
+
+
+def test_a_core_response_naming_a_different_member_is_refused() -> None:
+    """Fail closed. Refusing to answer is recoverable; answering with someone
+    else's profile under this URL, and caching it, is not."""
+    core = load_fixture("voyager_core.json")
+    core["included"][0]["publicIdentifier"] = "somebody-entirely-different"
+    client = make_client(override("core", json_response(core)))
+
+    error = expect_api_error(lambda: fetch(client))
+
+    assert error.code == "UPSTREAM_ERROR"
+
+
+def test_a_malformed_core_envelope_is_an_upstream_error_not_a_missing_person() -> None:
+    """"We could not read this" and "this person does not exist" are different
+    claims, and only one of them is true."""
+    client = make_client(override("core", json_response({"included": []})))
+
+    assert expect_api_error(lambda: fetch(client)).code == "UPSTREAM_ERROR"
 
 
 def test_a_core_response_with_no_profile_entity_is_profile_not_found() -> None:
@@ -703,6 +951,10 @@ def test_retry_after_is_propagated_when_upstream_sends_one() -> None:
         "12\r\nX-Injected: yes",  # header injection through a propagated value
         "999999999999999999",
         "-5",
+        # `Retry-After: 0` parses fine and means "retry immediately", which is
+        # the one instruction guaranteed to make throttling worse.
+        "0",
+        "00",
     ],
 )
 def test_an_unparseable_retry_after_is_dropped_rather_than_propagated(
@@ -721,15 +973,63 @@ def test_an_unparseable_retry_after_is_dropped_rather_than_propagated(
     assert "x-injected" not in {k.lower() for k in error.to_response().headers}
 
 
-def test_a_throttled_section_degrades_and_records_its_code() -> None:
-    """Story 6 needs to know *why* a section is missing, not merely that it is."""
-    client = make_client(override("skills", status_response(429)))
+@pytest.mark.parametrize(
+    "outcome,expected",
+    [
+        (status_response(429), "RATE_LIMITED"),
+        (status_response(401), "SESSION_EXPIRED"),
+        (html_response(), "UPSTREAM_CHALLENGE"),
+    ],
+)
+def test_a_systemic_section_failure_aborts_the_whole_fetch(
+    outcome: Any, expected: str
+) -> None:
+    """These three are facts about the ACCOUNT, not about one sub-resource.
+
+    If the session died, it died for all six calls; if LinkedIn is throttling,
+    it is throttling the account. Answering 200 with whichever sections
+    happened to land first is not a partial answer, it is a wrong one — and
+    story 7 would cache it, so the lie would outlive the condition that caused
+    it.
+    """
+    client = make_client(override("skills", outcome))
+
+    error = expect_api_error(lambda: fetch(client))
+
+    assert error.code == expected
+    assert error.code in voyager.SYSTEMIC_CODES
+
+
+def test_a_systemic_abort_still_carries_retry_after() -> None:
+    """Aborting must not cost the caller the one header telling them when."""
+    client = make_client(
+        override("skills", status_response(429, headers={"retry-after": "90"}))
+    )
+
+    error = expect_api_error(lambda: fetch(client))
+
+    assert error.to_response().headers["retry-after"] == "90"
+
+
+def test_a_per_section_failure_still_degrades() -> None:
+    """The other half of the rule: a 404 really can be about one sub-resource."""
+    client = make_client(override("skills", status_response(404)))
 
     profile = fetch(client)
 
     assert profile.sections["skills"].ok is False
-    assert profile.sections["skills"].error_code == "RATE_LIMITED"
+    assert profile.sections["skills"].error_code == "PROFILE_NOT_FOUND"
     assert profile.failed_sections == ["skills"]
+
+
+def test_the_systemic_set_is_exactly_the_account_wide_conditions() -> None:
+    """Pinned, because widening it silently turns partials into hard failures
+    and narrowing it silently turns hard failures into cheerful lies."""
+    assert voyager.SYSTEMIC_CODES == {
+        "SESSION_EXPIRED",
+        "RATE_LIMITED",
+        "UPSTREAM_CHALLENGE",
+    }
 
 
 # --- Challenge ----------------------------------------------------------------
@@ -787,6 +1087,47 @@ def test_linkedins_own_999_status_is_a_challenge() -> None:
     client = make_client(override("core", status_response(999)))
 
     assert expect_api_error(lambda: fetch(client)).code == "UPSTREAM_CHALLENGE"
+
+
+def test_a_401_landing_on_the_login_page_is_expiry_not_a_challenge() -> None:
+    """The single most consequential ordering decision in the classifier.
+
+    A dead `li_at` is usually signalled by LinkedIn bouncing the request to the
+    login page: the landing URL matches a wall marker and the body is HTML, so
+    every signal a challenge has is present. Classifying on that first makes
+    the commonest expiry an UPSTREAM_CHALLENGE — `retryable: true` — which
+    story 7 stale-serves unboundedly. The caller would be fed ever-older cached
+    data forever and never once told to store a new cookie, which is the entire
+    reason SESSION_EXPIRED exists as a separate code.
+    """
+    client = make_client(
+        override("core", html_response(status=401, url="https://www.linkedin.com/uas/login"))
+    )
+
+    error = expect_api_error(lambda: fetch(client))
+
+    assert error.code == "SESSION_EXPIRED"
+    assert error.spec.status_code == 428
+    assert error.spec.retryable is False, "a retryable code here would be stale-served"
+
+
+def test_expiry_and_challenge_land_on_different_codes() -> None:
+    """The pair, asserted together — the bug was that both gave one answer."""
+    expired = make_client(
+        override("core", html_response(status=401, url="https://www.linkedin.com/uas/login"))
+    )
+    challenged = make_client(override("core", html_response(status=200)))
+
+    assert expect_api_error(lambda: fetch(expired)).code == "SESSION_EXPIRED"
+    assert expect_api_error(lambda: fetch(challenged)).code == "UPSTREAM_CHALLENGE"
+
+
+def test_a_403_on_a_wall_url_is_also_expiry() -> None:
+    client = make_client(
+        override("core", html_response(status=403, url="https://www.linkedin.com/authwall"))
+    )
+
+    assert expect_api_error(lambda: fetch(client)).code == "SESSION_EXPIRED"
 
 
 def test_a_challenge_is_not_reported_as_a_missing_profile() -> None:
@@ -918,10 +1259,303 @@ def test_a_body_that_claims_json_but_is_not_is_an_upstream_error() -> None:
     assert expect_api_error(lambda: fetch(client)).code == "UPSTREAM_ERROR"
 
 
+def test_a_deeply_nested_body_is_a_typed_error_not_a_recursion_crash() -> None:
+    """CAP-6, at the one place the guard did not reach.
+
+    `json.loads` raises RecursionError on deeply nested input — reachable well
+    under MAX_BODY_BYTES, since nesting costs a byte a level — and
+    RecursionError is not in the narrow clause the classifier catches. Guarding
+    only the transport call left this escaping as a naked 500 on a body
+    LinkedIn would never send but anything positioned between us and it could.
+    """
+    depth = 200_000
+    body = b'{"a":' * depth + b"1" + b"}" * depth
+    assert len(body) < voyager.MAX_BODY_BYTES, "must be a nesting problem, not a size one"
+
+    client = make_client(
+        override(
+            "core",
+            VoyagerResponse(
+                status=200,
+                url="https://www.linkedin.com/voyager/api/x",
+                headers={"content-type": "application/json"},
+                body=body,
+            ),
+        )
+    )
+
+    error = expect_api_error(lambda: fetch(client))
+
+    assert error.code == "UPSTREAM_ERROR"
+    assert error.spec.status_code == 502
+
+
 def test_a_json_array_where_an_object_belongs_is_an_upstream_error() -> None:
     client = make_client(override("core", json_response([1, 2, 3])))
 
     assert expect_api_error(lambda: fetch(client)).code == "UPSTREAM_ERROR"
+
+
+# --- The real transport, which every test above replaces --------------------------
+#
+# Everything before this point injects `FakeTransport`, which proves the
+# classifier and proves nothing about the thing that feeds it. Breaking the
+# HTTPError conversion, the header lower-casing, or the body cap left the whole
+# offline suite green while a real 401 became UPSTREAM_ERROR, a real 429 lost
+# its Retry-After, and every real 200 was reported as a challenge.
+
+
+class FakeOpener:
+    """Stands in for the module-level urllib opener."""
+
+    def __init__(self, outcome: Any) -> None:
+        self.outcome = outcome
+        self.requests: list[urllib.request.Request] = []
+        self.timeouts: list[float] = []
+
+    def open(self, request: urllib.request.Request, timeout: float = 0) -> Any:
+        self.requests.append(request)
+        self.timeouts.append(timeout)
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome
+
+
+class FakeHTTPResponse:
+    """The subset of `http.client.HTTPResponse` the transport actually touches."""
+
+    def __init__(self, status: int, headers: dict[str, str], body: bytes, url: str):
+        self.status = status
+        self.headers = headers
+        self._body = io.BytesIO(body)
+        self._url = url
+
+    def read(self, amount: int | None = None) -> bytes:
+        return self._body.read(amount)
+
+    def geturl(self) -> str:
+        return self._url
+
+    def __enter__(self) -> FakeHTTPResponse:
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        return False
+
+
+def http_error(status: int, headers: dict[str, str], body: bytes) -> urllib.error.HTTPError:
+    message = email.message.Message()
+    for name, value in headers.items():
+        message[name] = value
+    return urllib.error.HTTPError(
+        "https://www.linkedin.com/voyager/api/x", status, "err", message, io.BytesIO(body)
+    )
+
+
+@pytest.fixture(name="opener")
+def _opener(monkeypatch: pytest.MonkeyPatch) -> Callable[[Any], FakeOpener]:
+    def install(outcome: Any) -> FakeOpener:
+        fake = FakeOpener(outcome)
+        monkeypatch.setattr(voyager, "_OPENER", fake)
+        return fake
+
+    return install
+
+
+def test_the_transport_turns_an_http_error_status_into_a_response(opener: Any) -> None:
+    """urllib RAISES on >= 400. Letting that propagate makes every 401, 404,
+    410 and 429 an indistinguishable transport failure."""
+    opener(http_error(429, {"Retry-After": "60"}, b'{"x":1}'))
+
+    response = urllib_transport("https://www.linkedin.com/voyager/api/x", {}, 5.0)
+
+    assert response.status == 429
+    assert response.headers["retry-after"] == "60"
+    assert response.body == b'{"x":1}'
+
+
+def test_a_real_401_reaches_the_classifier_as_session_expired(opener: Any) -> None:
+    """The conversion above, followed all the way through to a caller's code."""
+    opener(http_error(401, {"Content-Type": "text/html"}, b"<html>login</html>"))
+    client = VoyagerClient(SENTINEL_COOKIE, transport=urllib_transport)
+
+    error = expect_api_error(lambda: fetch(client))
+
+    assert error.code == "SESSION_EXPIRED"
+
+
+def test_a_real_429_reaches_the_caller_with_its_retry_after(opener: Any) -> None:
+    opener(http_error(429, {"Retry-After": "45"}, b"{}"))
+    client = VoyagerClient(SENTINEL_COOKIE, transport=urllib_transport)
+
+    error = expect_api_error(lambda: fetch(client))
+
+    assert error.code == "RATE_LIMITED"
+    assert error.to_response().headers["retry-after"] == "45"
+
+
+def test_the_transport_lower_cases_header_names(opener: Any) -> None:
+    """LinkedIn's casing is not stable, and every lookup downstream is lower."""
+    opener(
+        FakeHTTPResponse(
+            200,
+            {"Content-Type": "application/json", "RETRY-AFTER": "1"},
+            b"{}",
+            "https://www.linkedin.com/voyager/api/x",
+        )
+    )
+
+    response = urllib_transport("https://www.linkedin.com/voyager/api/x", {}, 5.0)
+
+    assert response.headers["content-type"] == "application/json"
+    assert response.headers["retry-after"] == "1"
+    assert response.is_json, "a mis-cased content-type reads as a challenge"
+
+
+def test_the_transport_caps_the_body_size(
+    opener: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unbounded read lets one hostile response exhaust the container."""
+    monkeypatch.setattr(voyager, "MAX_BODY_BYTES", 16)
+    opener(
+        FakeHTTPResponse(
+            200, {"Content-Type": "application/json"}, b"x" * 64, "https://www.linkedin.com/x"
+        )
+    )
+
+    with pytest.raises(TransportError):
+        urllib_transport("https://www.linkedin.com/voyager/api/x", {}, 5.0)
+
+
+def test_a_body_exactly_at_the_cap_is_allowed(
+    opener: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Off-by-one guard: the cap is a maximum, not a forbidden value."""
+    monkeypatch.setattr(voyager, "MAX_BODY_BYTES", 16)
+    opener(
+        FakeHTTPResponse(
+            200, {"Content-Type": "application/json"}, b"x" * 16, "https://www.linkedin.com/x"
+        )
+    )
+
+    assert len(urllib_transport("https://www.linkedin.com/voyager/api/x", {}, 5.0).body) == 16
+
+
+def test_a_url_error_becomes_a_transport_error(opener: Any) -> None:
+    opener(urllib.error.URLError("name resolution failed"))
+
+    with pytest.raises(TransportError):
+        urllib_transport("https://www.linkedin.com/voyager/api/x", {}, 5.0)
+
+
+def test_the_transport_reports_the_final_url_after_redirects(opener: Any) -> None:
+    """Challenge detection reads this; a wrong value silently disables it."""
+    opener(
+        FakeHTTPResponse(
+            200, {"Content-Type": "text/html"}, b"<html>", "https://www.linkedin.com/authwall"
+        )
+    )
+
+    response = urllib_transport("https://www.linkedin.com/voyager/api/x", {}, 5.0)
+
+    assert response.url == "https://www.linkedin.com/authwall"
+
+
+def test_the_transport_sends_the_headers_it_is_given(opener: Any) -> None:
+    fake = opener(
+        FakeHTTPResponse(200, {"Content-Type": "application/json"}, b"{}", "https://x.invalid")
+    )
+
+    urllib_transport("https://www.linkedin.com/voyager/api/x", {"cookie": "a=b"}, 5.0)
+
+    # urllib capitalises header names on the Request object.
+    assert fake.requests[0].get_header("Cookie") == "a=b"
+
+
+# --- Redirects must not walk the cookie off LinkedIn ------------------------------
+
+
+def _redirect(newurl: str) -> Any:
+    handler = LinkedInRedirectHandler()
+    request = urllib.request.Request(
+        "https://www.linkedin.com/voyager/api/me", headers={"Cookie": "li_at=x"}
+    )
+    return handler.redirect_request(
+        request, io.BytesIO(b""), 302, "Found", email.message.Message(), newurl
+    )
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://evil.invalid/collect",
+        "http://linkedin.com.evil.invalid/collect",
+        "https://127.0.0.1/collect",
+        "https://linkedin.com.example.invalid/",
+    ],
+)
+def test_a_redirect_off_linkedin_is_refused(target: str) -> None:
+    """urllib follows redirects and FORWARDS a manually-set header to the new
+    host — it strips only content headers, so a `Cookie` survives the hop.
+
+    Without this handler the module's central claim, that the session cookie
+    goes to exactly one host, is simply false, and the failure is silent: the
+    request succeeds and the cookie is merely also somewhere else.
+    """
+    with pytest.raises(CrossHostRedirect):
+        _redirect(target)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://www.linkedin.com/voyager/api/me",
+        "https://linkedin.com/voyager/api/me",
+        "https://in.linkedin.com/voyager/api/me",
+    ],
+)
+def test_a_redirect_within_linkedin_is_followed(target: str) -> None:
+    assert _redirect(target) is not None
+
+
+def test_the_redirect_cap_is_lower_than_urllibs_default() -> None:
+    """Each hop is another chance to hand the cookie somewhere it should not go."""
+    assert LinkedInRedirectHandler.max_redirections == voyager.MAX_REDIRECTS
+    assert voyager.MAX_REDIRECTS < urllib.request.HTTPRedirectHandler.max_redirections
+
+
+def test_the_module_builds_its_opener_with_the_redirect_policy() -> None:
+    """A bare `urlopen` anywhere in this module would bypass the whole guard."""
+    opener = voyager._build_opener()
+
+    assert any(isinstance(h, LinkedInRedirectHandler) for h in opener.handlers)
+    assert "urlopen(" not in (REPO_ROOT / "app" / "linkedin" / "client.py").read_text(
+        encoding="utf-8"
+    )
+
+
+# --- Timeouts ---------------------------------------------------------------------
+
+
+def test_every_request_carries_the_default_timeout() -> None:
+    """A stalled socket with no timeout pins an executor thread forever, and
+    five concurrent sections means five threads."""
+    client = make_client()
+
+    fetch(client)
+
+    timeouts = {call.timeout for call in client.transport.calls}  # type: ignore[attr-defined]
+    assert timeouts == {voyager.DEFAULT_TIMEOUT_SECONDS}
+    assert isinstance(voyager.DEFAULT_TIMEOUT_SECONDS, (int, float))
+    assert voyager.DEFAULT_TIMEOUT_SECONDS > 0
+
+
+def test_a_timeout_override_reaches_the_transport() -> None:
+    client = make_client(timeout=3.5)
+
+    fetch(client)
+
+    assert {call.timeout for call in client.transport.calls} == {3.5}  # type: ignore[attr-defined]
 
 
 # --- The cookie never leaks -------------------------------------------------------
@@ -959,6 +1593,7 @@ def test_the_cookie_reaches_the_cookie_header_and_no_other_field() -> None:
 #: sentinel cookie and inspected for a leak.
 LEAK_PATHS = [
     ("core", status_response(401), "refused session"),
+    ("skills", status_response(429, headers={"retry-after": "30"}), "systemic abort"),
     ("core", status_response(404), "unknown profile"),
     ("core", status_response(429, headers={"retry-after": "30"}), "throttled"),
     ("core", status_response(410), "withdrawn endpoint"),
@@ -1007,6 +1642,15 @@ def test_the_raw_profile_does_not_carry_the_cookie_anywhere() -> None:
     assert SENTINEL_COOKIE not in json.dumps(profile.core)
 
 
+#: Modules allowed to name the session cookie. An allowlist rather than an
+#: exact match, because story 5's session vault will legitimately join it — and
+#: a test that fails when the next story does the right thing teaches everyone
+#: to edit the test without reading it.
+COOKIE_HANDLING_MODULES = {
+    "app/linkedin/client.py",  # builds the request header — the only caller
+}
+
+
 def test_the_cookie_name_is_handled_only_inside_the_client() -> None:
     """Automates the story's `grep -rIn "li_at" app/` verification command.
 
@@ -1014,13 +1658,21 @@ def test_the_cookie_name_is_handled_only_inside_the_client() -> None:
     stored unencrypted, or echoed into an error body — and the audit that would
     catch it is a grep nobody runs twice.
     """
-    offenders = [
+    handlers = {
         path.relative_to(REPO_ROOT).as_posix()
         for path in sorted((REPO_ROOT / "app").rglob("*.py"))
         if "li_at" in path.read_text(encoding="utf-8")
-    ]
+    }
 
-    assert offenders == ["app/linkedin/client.py"], offenders
+    unexpected = sorted(handlers - COOKIE_HANDLING_MODULES)
+    assert not unexpected, (
+        f"{unexpected} touch the session cookie. If that is deliberate — story 5's "
+        "vault legitimately handles one — add it to COOKIE_HANDLING_MODULES with a "
+        "note saying why. If it is not, the cookie has spread, and every new place "
+        "is a new place it can be logged, stored unencrypted, or echoed into an "
+        "error body."
+    )
+    assert "app/linkedin/client.py" in handlers, "the client must still be the one that does"
 
 
 def test_the_client_never_reads_configuration() -> None:
@@ -1078,7 +1730,15 @@ def test_no_error_message_leaks_an_upstream_detail() -> None:
 FIXTURE_FILES = sorted(p for p in FIXTURES.iterdir() if p.is_file())
 
 #: The only person who appears in any fixture, and she does not exist.
-SYNTHETIC_IDENTIFIERS = {"ada-placeholder", "Ada", "Placeholder"}
+SYNTHETIC_IDENTIFIERS = {
+    "ada-placeholder",
+    "Ada",
+    "Placeholder",
+    # The decoy in voyager_me.json, which exists so that a first-hit scan of
+    # `included` returns the wrong person and fails a test.
+    "decoy-placeholder",
+    "Decoy",
+}
 
 #: Substrings that would mean a real capture leaked into the repository.
 FORBIDDEN_IN_FIXTURES = [
@@ -1123,18 +1783,73 @@ def test_no_fixture_carries_a_secret_or_a_real_person(path: Path) -> None:
             assert host.endswith(".invalid"), f"{path.name} names host {host!r}"
 
 
-def test_the_only_person_in_the_fixtures_is_invented() -> None:
-    core = load_fixture("voyager_core.json")["included"][0]
+def test_every_person_named_in_any_fixture_is_invented() -> None:
+    """Sweeps the whole corpus, not just the core file.
 
-    assert core["publicIdentifier"] in SYNTHETIC_IDENTIFIERS
-    assert core["firstName"] in SYNTHETIC_IDENTIFIERS
-    assert core["lastName"] in SYNTHETIC_IDENTIFIERS
-    # Fields a real capture carries that no synthetic fixture has any reason to.
-    for private in ("emailAddress", "phoneNumbers", "birthDateOn", "address"):
-        assert private not in core, private
+    The narrower version of this test read one entity out of one fixture, which
+    would have missed a real name anywhere else — including in the `me` fixture
+    that was later extended.
+    """
+    seen: set[str] = set()
+    for path in FIXTURE_FILES:
+        if path.suffix != ".json":
+            continue
+        stack: list[Any] = [json.loads(path.read_text(encoding="utf-8"))]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                for key in ("publicIdentifier", "firstName", "lastName"):
+                    if isinstance(node.get(key), str):
+                        seen.add(node[key])
+                # Fields a real capture carries that no synthetic fixture has
+                # any reason to. A captured payload would drag these along.
+                for private in (
+                    "emailAddress", "phoneNumbers", "birthDateOn", "address",
+                    "trackingId", "objectUrn" if False else "weChatContactInfo",
+                ):
+                    assert private not in node, f"{path.name} carries {private}"
+                stack.extend(node.values())
+            elif isinstance(node, list):
+                stack.extend(node)
+
+    assert seen, "walked no identity fields — the walk is broken, not the fixtures"
+    assert seen <= SYNTHETIC_IDENTIFIERS, sorted(seen - SYNTHETIC_IDENTIFIERS)
 
 
 # --- The fixtures still mirror the measured shapes ---------------------------------
+
+
+#: The story's measured shape table, transcribed. Every field LinkedIn was
+#: observed to populate on 2026-08-27 and that story 6 maps onto
+#: `response-schema.md`. A fixture that quietly loses one of these lets story 6
+#: be written against a shape narrower than the source actually sends.
+MEASURED_SHAPES = {
+    "voyager_experience.json": [
+        "title", "companyName", "companyUrn", "dateRange", "description",
+        "employmentTypeUrn", "locationName", "geoLocationName",
+    ],
+    "voyager_education.json": [
+        "schoolName", "schoolUrn", "degreeName", "fieldOfStudy", "grade", "dateRange",
+    ],
+    "voyager_certifications.json": ["name", "authority", "url", "licenseNumber", "dateRange"],
+    "voyager_skills.json": ["name"],
+    "voyager_languages.json": ["name", "proficiency"],
+}
+
+
+@pytest.mark.parametrize("fixture,fields", sorted(MEASURED_SHAPES.items()))
+def test_a_fixture_carries_every_measured_field(fixture: str, fields: list[str]) -> None:
+    """Checked across the union of a section's entities, not each one.
+
+    A field may legitimately be absent from an individual entry — a current
+    role has no `end` — but no field in the measured table may be absent from
+    the whole section, or nothing in the corpus exercises it.
+    """
+    entities = resolve_elements(load_fixture(fixture))
+
+    assert entities, fixture
+    present = set().union(*(set(entity) for entity in entities))
+    assert not [f for f in fields if f not in present], sorted(set(fields) - present)
 
 
 def test_the_core_fixture_carries_every_field_story_6_needs() -> None:

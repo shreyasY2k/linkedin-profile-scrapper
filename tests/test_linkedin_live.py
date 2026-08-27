@@ -106,17 +106,29 @@ def test_all_six_resources_still_answer(client: VoyagerClient) -> None:
     }
     assert not unreadable, f"sub-resources failed: {unreadable}"
 
-    # The default page size of 20 truncated this profile's 33 skills to 20,
-    # with a 200 and no error — a complete-looking lie. `count=100` fixed it.
-    # Asserted live because no offline fixture can notice the page size
-    # regressing; the symptom is a shorter list, not a failure.
-    assert not profile.truncated_sections, profile.truncated_sections
+    # Every section came back as a well-formed collection. Asserted as a
+    # property of the ENVELOPE, not of this person: a profile with genuinely
+    # zero certifications is fine and must stay fine.
+    for name, section in profile.sections.items():
+        assert section.payload is not None, name
+        assert section.element_count is not None, name
+        assert section.resolved_count == section.element_count, name
+
+    # Truncation is REPORTED, not asserted away. Asserting "nothing is
+    # truncated" would be a claim about how many skills this particular
+    # developer has — it passed only because the page-size fix happens to
+    # cover 33 of them, and it would fail on a profile with 120. What matters
+    # is that a page-size regression is visible, which the offline suite pins.
+    if profile.truncated_sections:
+        print(f"note: sections at the page limit: {profile.truncated_sections}")
 
     # Six for the profile, plus the one `me` call that identified it. If this
     # ever reads higher, a live call was added somewhere — which the story puts
-    # behind Ask First.
+    # behind Ask First. This is a property of the endpoint map, not of the
+    # profile: it is six calls for everyone.
     assert profile.call_count == 6
     assert client.call_count == 7
+    assert profile.fetched_at.tzinfo is not None
 
     # Nothing is written anywhere. The tempting next step when a mapping fails
     # is to dump the live payload into `tests/fixtures/` and iterate against

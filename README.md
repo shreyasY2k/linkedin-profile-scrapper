@@ -148,14 +148,45 @@ in `.env`. That line matters only if you run the app outside compose. (If your
 password contains `@ : / ? #`, percent-encode it in the compose expression.)
 
 Every variable `Settings` declares is **required and non-empty**, including the
-ones no code reads yet. A deployment missing `SESSION_ENCRYPTION_KEY` dies at
-boot with that field named on stderr, rather than at the first request that
-needs it. The API container will never report healthy with a broken
-environment.
+ones no code reads yet, with exactly one deliberate exception noted below. A
+deployment missing `SESSION_ENCRYPTION_KEY` dies at boot with that field named
+on stderr, rather than at the first request that needs it. The API container
+will never report healthy with a broken environment.
+
+The exception is `LINKEDIN_DEV_COOKIE`, which is **optional and must be left
+blank in any deployment**. It is a developer's own LinkedIn session, read only
+by the opt-in live check (see below). It is optional because real sessions
+arrive per-caller at runtime through `PUT /api/v1/session` — requiring it would
+force operators to invent a value for something the service never reads — and
+`docker-compose.yml` blanks it for the `api` container so that a value filled in
+locally never reaches the running process's environment.
 
 `.env` is gitignored and was gitignored in the commit that created the
 repository. No credential, cookie, key or secret belongs anywhere in this tree
 or in its history.
+
+### The live check
+
+Everything in the test suite runs offline against synthetic fixtures. One test
+does not: `tests/test_linkedin_live.py` calls the real Voyager API, to prove the
+endpoint map is still real. LinkedIn's internal API is unversioned and
+undocumented — the endpoint most documentation still names is already `410
+Gone` — so this is the only assertion that can fail for a reason no offline test
+can predict.
+
+It is **skipped by default** and needs two gates to run, so that CI and an
+evaluator running the suite never spend anyone's LinkedIn quota:
+
+```bash
+# 1. put your own li_at in .env as LINKEDIN_DEV_COOKIE (see .env.example)
+# 2. then:
+LINKEDIN_LIVE_CHECK=1 pytest -q -m live
+```
+
+It fetches only the profile the session itself owns — the public id comes from
+LinkedIn's `me` endpoint, not from a constant, so it cannot be pointed at a
+third party by editing a string. Run it at most once per change to
+`app/linkedin/client.py`.
 
 ### Reset the stack
 
@@ -222,16 +253,23 @@ _To be written by story 9._
 
 ```
 app/
-  config.py          the one configuration read; every field required
+  config.py          the one configuration read; every field required but one
   main.py            create_app(); OpenAPI title/version; routers mounted
   auth.py            JWKS-backed bearer validation, as a FastAPI dependency
   errors.py          the typed error envelope from response-schema.md
   api/
     health.py        unauthenticated GET /health
     v1/__init__.py   APIRouter(prefix="/api/v1") — the seam AND the auth boundary
+  linkedin/
+    client.py        the Voyager client: the ONLY place that holds a LinkedIn
+                     session, calls linkedin.com, or knows the endpoint map
 tests/
   test_health.py     liveness + missing-configuration coverage
   test_auth.py       the full token-rejection matrix, signed offline
+  test_linkedin_client.py  the retrieval edge-case matrix, entirely offline
+  test_linkedin_live.py    the one opt-in live check; skipped by default
+  fixtures/          synthetic Voyager payloads — invented people, .invalid
+                     hosts, no captured data (a test enforces this)
 deploy/
   keycloak/          the committed realm export, imported on container start
   nginx/             the deployed site config (story 2)

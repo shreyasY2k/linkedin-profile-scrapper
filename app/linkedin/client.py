@@ -161,6 +161,19 @@ SECTION_PAGE_SIZE = 100
 #: ``$type`` suffix identifying the core entity inside ``included``.
 PROFILE_TYPE_SUFFIX = "identity.profile.Profile"
 
+#: Failures that are facts about the ACCOUNT, not about one sub-resource.
+#:
+#: A section that hits one of these aborts the whole fetch instead of degrading
+#: into ``partial[]``. The reasoning is that all three are account-wide by
+#: construction — if the session died, it died for all six calls; if LinkedIn
+#: is throttling, it is throttling the account — so a 200 carrying whichever
+#: sections happened to land first is not a partial answer, it is a wrong one.
+#: And story 7 would cache it, so the lie would outlive the condition.
+#:
+#: Everything else (404, a malformed envelope, an unexpected status) really can
+#: be specific to one sub-resource, and those still degrade.
+SYSTEMIC_CODES = frozenset({"SESSION_EXPIRED", "RATE_LIMITED", "UPSTREAM_CHALLENGE"})
+
 #: Path fragments that mean LinkedIn answered with a wall instead of data. A
 #: challenge usually arrives as a *redirect* that urllib follows, so the final
 #: URL is the reliable signal — the status on the page it lands on is 200.
@@ -179,7 +192,35 @@ LINKEDIN_BOT_STATUS = 999
 #: `Retry-After` is only propagated in its delta-seconds form. The HTTP-date
 #: form is legal but LinkedIn does not send it, and echoing an unvalidated
 #: upstream header into our own response is how a header-injection bug starts.
+#:
+#: A value that parses but is not *positive* is dropped too. `Retry-After: 0`
+#: propagated verbatim tells a throttled caller to retry immediately, which is
+#: the one instruction guaranteed to make throttling worse.
 RETRY_AFTER_RE = re.compile(r"^\d{1,7}$")
+
+#: How many redirects one request may follow before the transport gives up.
+#: Lower than urllib's default of 10: a Voyager call that needs more than a
+#: couple of hops is being walked somewhere, and each hop is another chance to
+#: hand the session cookie to a host that should not have it.
+MAX_REDIRECTS = 4
+
+#: Characters that may never appear in a value this module writes into a
+#: header. CR and LF are header injection; `;` and `"` would break out of the
+#: cookie value into another cookie or terminate a quoted one; the rest are
+#: control characters `http.client` refuses outright.
+#:
+#: The refusal matters more than it looks. `http.client` raises `ValueError`
+#: with the offending header value INSIDE the message, so a cookie carrying a
+#: newline would put itself into an exception string, and a `ValueError` from
+#: the transport becomes a *retryable* UPSTREAM_ERROR — which story 7 would
+#: then stale-serve forever, for a cookie that can never work. Rejecting at
+#: construction turns an unfixable retry loop into one accurate 428.
+_HEADER_UNSAFE_RE = re.compile(r'[\x00-\x20\x7f;",\\]')
+
+#: A real ``li_at`` is around 150 characters. The cap is generous rather than
+#: tight because the value is opaque and LinkedIn may lengthen it; what it
+#: stops is a megabyte of junk being assembled into a request header.
+MAX_COOKIE_LENGTH = 4096
 
 #: ``/in/{public-id}``, with an optional locale prefix (``/en/in/x``) and any
 #: trailing sub-path (``/in/x/details/experience``) that LinkedIn's own UI adds.
@@ -194,6 +235,10 @@ PROFILE_PATH_RE = re.compile(
 #: allowlist would reject them as malformed.
 _ILLEGAL_PUBLIC_ID_RE = re.compile(r"[\s/\\?#\x00-\x1f\x7f]")
 MAX_PUBLIC_ID_LENGTH = 100
+
+#: A URL scheme, per RFC 3986. Used only to decide whether a pasted string is
+#: missing one; the scheme itself is still checked against http(s) afterwards.
+_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:")
 
 
 # --- The session -------------------------------------------------------------
@@ -220,7 +265,7 @@ class LinkedInSession:
     PLACEHOLDER = "<linkedin-session redacted>"
 
     def __init__(self, value: str) -> None:
-        cleaned = (value or "").strip()
+        cleaned = (value or "").strip() if isinstance(value, str) else ""
         if not cleaned:
             # NO_SESSION, not SESSION_EXPIRED. The matrix requires a caller who
             # has stored nothing to be told something different from a caller
@@ -229,6 +274,24 @@ class LinkedInSession:
             raise ApiError(
                 "NO_SESSION",
                 log_detail="empty LinkedIn session cookie supplied to the client",
+            )
+        # SESSION_EXPIRED rather than NO_SESSION for a value that is present
+        # but unusable. A session *was* supplied, so "you have not stored one"
+        # would be wrong; and the remedy this code states — supply a new one —
+        # is exactly right. Crucially it is `retryable: false`, so story 7 does
+        # not stale-serve a caller forever over a cookie that can never work.
+        #
+        # The detail deliberately says nothing about WHICH character offended:
+        # that sentence would be built from the cookie.
+        if len(cleaned) > MAX_COOKIE_LENGTH:
+            raise ApiError(
+                "SESSION_EXPIRED",
+                log_detail=f"session cookie is {len(cleaned)} characters, over the cap",
+            )
+        if _HEADER_UNSAFE_RE.search(cleaned):
+            raise ApiError(
+                "SESSION_EXPIRED",
+                log_detail="session cookie contains a character illegal in a header",
             )
         self._value = cleaned
 
@@ -252,6 +315,10 @@ class TransportError(Exception):
     Distinct from an HTTP error status, which arrives as a
     :class:`VoyagerResponse` and is classified from its status and body.
     """
+
+
+class CrossHostRedirect(TransportError):
+    """A redirect pointed off LinkedIn, and following it would leak the cookie."""
 
 
 @dataclass(frozen=True)
@@ -304,6 +371,71 @@ def _lower_headers(raw: Any) -> dict[str, str]:
     return {str(name).lower(): str(value) for name, value in raw.items()}
 
 
+def is_linkedin_host(host: str) -> bool:
+    """Whether ``host`` is linkedin.com or a subdomain of it.
+
+    A *suffix* check anchored on a leading dot, never ``startswith`` and never
+    a bare ``in``: ``linkedin.com.example.test`` is not LinkedIn, and treating
+    it as such is how a redirect walks the session cookie off to an attacker.
+    """
+    host = (host or "").lower()
+    return host == LINKEDIN_HOST or host.endswith("." + LINKEDIN_HOST)
+
+
+class LinkedInRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuses to follow a redirect that leaves LinkedIn.
+
+    This exists because of a specific, verified stdlib behaviour: ``urllib``
+    follows redirects automatically and **forwards headers the caller set
+    manually to the redirect target**. It strips only content headers
+    (``Content-Length``, ``Content-Type``, ``Transfer-Encoding``); a manually
+    supplied ``Cookie`` header survives the hop and is handed to the new host
+    verbatim.
+
+    LinkedIn answers an unauthenticated request with a redirect, and a redirect
+    target is not something this codebase controls. Without this handler, the
+    module's central claim — that the session cookie is written in exactly one
+    place and goes to exactly one host — is false, and the failure is silent:
+    the request succeeds, and the cookie is simply also somewhere else.
+
+    ``max_redirections`` is lowered from urllib's 10 to :data:`MAX_REDIRECTS`.
+    """
+
+    max_redirections = MAX_REDIRECTS
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        try:
+            host = urllib.parse.urlsplit(newurl).hostname or ""
+        except ValueError:
+            host = ""
+        if not is_linkedin_host(host):
+            # Raised, not returned-as-None: returning None makes urllib treat
+            # the redirect as a final response and hand the *wall page* back as
+            # if it were data. This must be loud.
+            raise CrossHostRedirect(
+                f"refused a {code} redirect to non-LinkedIn host {host!r}"
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _build_opener() -> urllib.request.OpenerDirector:
+    """One opener, carrying the redirect policy. Replaced wholesale in tests."""
+    return urllib.request.build_opener(LinkedInRedirectHandler())
+
+
+#: Module-level so the redirect policy cannot be bypassed by calling
+#: ``urlopen`` directly — there is no other opener in this module.
+_OPENER = _build_opener()
+
+
 def urllib_transport(
     url: str, headers: Mapping[str, str], timeout: float
 ) -> VoyagerResponse:
@@ -323,7 +455,7 @@ def urllib_transport(
     """
     request = urllib.request.Request(url, headers=dict(headers), method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _OPENER.open(request, timeout=timeout) as response:
             return VoyagerResponse(
                 status=response.status,
                 url=response.geturl(),
@@ -341,6 +473,10 @@ def urllib_transport(
             headers=_lower_headers(exc.headers) if exc.headers else {},
             body=body,
         )
+    except CrossHostRedirect:
+        # Already the right type and already says the right thing. Re-raised
+        # explicitly so the OSError clause below cannot reword it.
+        raise
     except urllib.error.URLError as exc:
         # `exc.reason` is a socket error or an SSL error. Neither contains a
         # request header, so neither can carry the cookie — but the client
@@ -372,7 +508,15 @@ def parse_profile_url(url: str) -> str:
     # A bare `www.linkedin.com/in/x` parses with an empty netloc and the whole
     # thing in `path`, which would then fail the host check for the wrong
     # reason. Give it a scheme so the host check judges the actual host.
-    if "//" not in candidate.split("?", 1)[0]:
+    #
+    # Detected by matching a scheme, not by looking for `//` anywhere in the
+    # string: a schemeless URL whose query or fragment happens to contain `//`
+    # (`linkedin.com/in/ada#a//b`) would be left alone by the naive test and
+    # then rejected as "scheme '' is not http(s)" — an error message pointing
+    # at something the caller did not do.
+    if candidate.startswith("//"):
+        candidate = "https:" + candidate
+    elif not _SCHEME_RE.match(candidate):
         candidate = "https://" + candidate
 
     try:
@@ -384,9 +528,10 @@ def parse_profile_url(url: str) -> str:
         raise _invalid_url(f"scheme {parts.scheme!r} is not http(s)")
 
     host = (parts.hostname or "").lower()
-    if host != LINKEDIN_HOST and not host.endswith("." + LINKEDIN_HOST):
+    if not is_linkedin_host(host):
         # Explicitly logged: `linkedin.com.evil.test` reaching a fetch would be
-        # an SSRF, and this is the line that stops it.
+        # an SSRF, and this is the line that stops it. The same predicate
+        # governs redirects, so the two cannot drift apart.
         raise _invalid_url(f"host {host!r} is not a LinkedIn host")
 
     match = PROFILE_PATH_RE.match(parts.path or "/")
@@ -403,7 +548,16 @@ def parse_profile_url(url: str) -> str:
         # exactly how a path separator or a null byte would be smuggled past a
         # check performed on the still-encoded form.
         raise _invalid_url("public id contains an illegal character")
-    return public_id
+    # Lower-cased, because LinkedIn treats public ids case-insensitively and
+    # this string becomes an identity downstream. Without it `/in/Ada` and
+    # `/in/ada` are two different people to this service: two story-7 cache
+    # keys, two six-call fetches of the same person, and two `public_id`
+    # values in responses that describe one profile.
+    #
+    # `.lower()` rather than `.casefold()`: casefold rewrites characters
+    # (`ß` -> `ss`), and this is an identifier that has to survive round-tripping
+    # into a URL, not a string being compared for linguistic equality.
+    return public_id.lower()
 
 
 def _invalid_url(detail: str) -> ApiError:
@@ -500,6 +654,22 @@ def reported_total(payload: Mapping[str, Any]) -> int | None:
     return total
 
 
+def is_collection_envelope(payload: Mapping[str, Any]) -> bool:
+    """Whether ``payload`` is a normalized collection response at all.
+
+    The distinction this draws is the one the whole story turns on. A 200
+    carrying a body with no ``data``, or a ``data`` with no ``*elements``, is
+    **unreadable** — the shape changed, or something other than a collection
+    came back. Reading zero elements out of it and reporting "this section is
+    empty" tells a caller, in `response-schema.md`'s own terms, that the
+    profile *has none* of something we simply could not read.
+
+    So a malformed envelope is a failure, never an empty result.
+    """
+    data = payload.get("data")
+    return isinstance(data, Mapping) and isinstance(data.get("*elements"), list)
+
+
 def find_entity(payload: Mapping[str, Any], type_suffix: str) -> dict[str, Any] | None:
     """First entity in ``included`` whose ``$type`` ends with ``type_suffix``."""
     included = payload.get("included")
@@ -545,6 +715,12 @@ class SectionFetch:
     #: is retrieved, so ``total > element_count`` means the list is truncated —
     #: which a 200 does not otherwise reveal. ``None`` means "not stated".
     reported_total: int | None = None
+    #: How many of the ``*elements`` URNs actually resolved against
+    #: ``included``. Normally equal to ``element_count``; when it is lower,
+    #: entities were referenced and not delivered, and the difference is a
+    #: silently dropped entry rather than an absent one. Recorded so story 6
+    #: reports the shortfall instead of shortening the list without saying so.
+    resolved_count: int | None = None
     #: Taxonomy code from ``response-schema.md`` when ``ok`` is False.
     error_code: str | None = None
 
@@ -587,11 +763,45 @@ class RawProfile:
         return [
             name
             for name, section in self.sections.items()
-            if section.ok
-            and section.reported_total is not None
-            and section.element_count is not None
-            and section.reported_total > section.element_count
+            if section.ok and _looks_truncated(section)
         ]
+
+    @property
+    def unresolved_sections(self) -> list[str]:
+        """Sections that referenced entities ``included`` did not deliver.
+
+        A third kind of incompleteness, distinct from failed and from
+        truncated: the call worked, the list is the right length, and some of
+        the entries are simply missing from the payload.
+        """
+        return [
+            name
+            for name, section in self.sections.items()
+            if section.ok
+            and section.resolved_count is not None
+            and section.element_count is not None
+            and section.resolved_count < section.element_count
+        ]
+
+
+def _looks_truncated(section: SectionFetch) -> bool:
+    """Whether ``section`` is missing entries the first page did not carry.
+
+    Two signals, and the second is not paranoia:
+
+    * ``paging.total`` exceeds what came back. The direct case.
+    * ``total`` is **absent** and exactly :data:`SECTION_PAGE_SIZE` elements
+      came back. A response that fills the page precisely is what truncation
+      looks like when the total is not reported, and calling it complete is a
+      coin flip on a real person's history. Treating it as truncated can only
+      cost a caller an unnecessary caveat; the other error publishes a partial
+      career as a whole one.
+    """
+    if section.element_count is None:
+        return False
+    if section.reported_total is not None:
+        return section.reported_total > section.element_count
+    return section.element_count >= SECTION_PAGE_SIZE
 
 
 # --- The client --------------------------------------------------------------
@@ -620,6 +830,18 @@ class VoyagerClient:
     ) -> None:
         self._session = LinkedInSession(cookie)
         self._transport = transport
+        # Same header-safety rules as the cookie, different failure type, and
+        # the difference is deliberate. The cookie is caller data, so a bad one
+        # is a 428 the caller can act on. The CSRF token is a code-level
+        # argument with a safe default that no caller supplies — a bad one is a
+        # bug in this repository, and a bug should be loud and unhandled here
+        # rather than dressed up as a session problem for someone else to
+        # debug. It is validated all the same because it lands in the same
+        # header and would inject just as happily.
+        if not isinstance(jsessionid, str) or not jsessionid.strip():
+            raise ValueError("jsessionid must be a non-empty string")
+        if len(jsessionid) > MAX_COOKIE_LENGTH or _HEADER_UNSAFE_RE.search(jsessionid):
+            raise ValueError("jsessionid contains a character illegal in a header")
         self._jsessionid = jsessionid
         self._user_agent = user_agent
         self._timeout = timeout
@@ -676,10 +898,15 @@ class VoyagerClient:
         calls_before = self.call_count
 
         core = await self._fetch_core(public_id)
-        profile = find_entity(core, PROFILE_TYPE_SUFFIX)
-        if profile is None:
-            raise self._not_found(public_id, "core response carried no Profile entity")
+        # Stamped here, not after the sections return. `fetched_at` means "when
+        # this data was read from LinkedIn" and it is, under unbounded
+        # stale-serve, the caller's ONLY staleness signal — so it has to be the
+        # read time, not the time the last of six concurrent calls happened to
+        # finish. Timezone-aware always: a naive timestamp serialises without
+        # an offset and silently becomes "some local time" to a consumer.
+        fetched_at = datetime.now(timezone.utc)
 
+        profile = self._core_profile(core, public_id)
         profile_urn = profile.get("entityUrn")
         if not isinstance(profile_urn, str) or not profile_urn:
             raise self._upstream_error(
@@ -706,13 +933,59 @@ class VoyagerClient:
             profile=profile,
             sections=sections,
             call_count=self.call_count - calls_before,
-            # The moment the data was actually read from LinkedIn, which is
-            # what `fetched_at` means on the wire — not when a response was
-            # served, and on a stale-serve those differ by design.
-            fetched_at=datetime.now(timezone.utc),
+            fetched_at=fetched_at,
         )
 
     # -- Fan-out -------------------------------------------------------------
+
+    def _core_profile(
+        self, core: Mapping[str, Any], public_id: str
+    ) -> dict[str, Any]:
+        """The ``Profile`` this query asked for — not merely the first one seen.
+
+        Two checks, and both guard the single worst thing this system can do,
+        which is to answer (and, through story 7, cache indefinitely) one
+        person's profile under another person's URL.
+
+        *Resolved through* ``*elements``, not scanned out of ``included``.
+        ``included`` is an unordered pool that can carry entities the query did
+        not ask about; "the first thing in it shaped like a Profile" is a
+        coincidence, not an identity. The URN in ``*elements`` is the response's
+        own statement of what it returned.
+
+        *Cross-checked against the requested public id.* If the entity names a
+        different person, this fails loudly rather than serving them. See the
+        note in the deferred-work log: a profile that has changed its vanity
+        URL could in principle answer under an old id, and this would refuse
+        it. Refusing to answer is recoverable; answering with the wrong human
+        being is not.
+        """
+        elements = resolve_elements(core)
+        profile = next(
+            (
+                entity
+                for entity in elements
+                if str(entity.get("$type", "")).endswith(PROFILE_TYPE_SUFFIX)
+            ),
+            None,
+        )
+        if profile is None:
+            raise self._not_found(
+                public_id, "no Profile entity resolved from the core *elements"
+            )
+
+        identifier = profile.get("publicIdentifier")
+        if isinstance(identifier, str) and identifier.lower() != public_id:
+            logger.error(
+                "Core lookup for %s returned publicIdentifier %s — refusing to "
+                "answer with a different member's profile.",
+                _loggable_public_id(public_id),
+                _loggable_public_id(identifier),
+            )
+            raise self._upstream_error(
+                CORE_RESOURCE, "core response named a different member"
+            )
+        return profile
 
     async def _fetch_core(self, public_id: str) -> dict[str, Any]:
         """The one call whose failure aborts the whole fetch."""
@@ -720,6 +993,14 @@ class VoyagerClient:
             {"q": "memberIdentity", "memberIdentity": public_id}
         )
         payload = await self._request(f"{CORE_RESOURCE}?{query}", resource=CORE_RESOURCE)
+
+        if not is_collection_envelope(payload):
+            # A 200 that is not a collection at all. UPSTREAM_ERROR, not
+            # PROFILE_NOT_FOUND: "we could not read this" and "this person does
+            # not exist" are different claims and only one of them is true.
+            raise self._upstream_error(
+                CORE_RESOURCE, "response was not a normalized collection envelope"
+            )
 
         if not element_urns(payload):
             # A well-formed id that does not exist answers 200 with an empty
@@ -732,19 +1013,44 @@ class VoyagerClient:
     async def _fetch_sections(self, profile_urn: str) -> dict[str, SectionFetch]:
         """Fan the five section calls out concurrently.
 
-        ``return_exceptions`` is not used: :meth:`_fetch_section` already
-        converts every failure into a recorded :class:`SectionFetch`, so a
-        raised exception here would be a bug in this module rather than an
-        upstream failure, and swallowing it would hide it.
+        ``return_exceptions=True`` because a systemic failure raised by one
+        section must not leave the other four running unobserved. Every result
+        is collected, then the systemic ones are re-raised.
         """
         names = list(SECTION_RESOURCES)
         results = await asyncio.gather(
-            *(self._fetch_section(name, profile_urn) for name in names)
+            *(self._fetch_section(name, profile_urn) for name in names),
+            return_exceptions=True,
         )
-        return dict(zip(names, results))
+
+        sections: dict[str, SectionFetch] = {}
+        systemic: ApiError | None = None
+        for name, result in zip(names, results):
+            if isinstance(result, SectionFetch):
+                sections[name] = result
+            elif isinstance(result, ApiError):
+                # First one wins; they will almost always be the same code,
+                # because the condition is account-wide by definition.
+                systemic = systemic or result
+            elif isinstance(result, BaseException):
+                # A bug in this module, not an upstream failure — but CAP-6
+                # still forbids it reaching a caller naked.
+                systemic = systemic or self._upstream_error(
+                    SECTION_RESOURCES[name],
+                    f"section task raised {type(result).__name__}: {self._safe(result)}",
+                )
+
+        if systemic is not None:
+            raise systemic
+        return sections
 
     async def _fetch_section(self, name: str, profile_urn: str) -> SectionFetch:
-        """One sub-resource. Never raises — a failure is a recorded outcome."""
+        """One sub-resource.
+
+        Raises only for a **systemic** failure — see :data:`SYSTEMIC_CODES`.
+        Everything else is a recorded outcome, so the other four sections still
+        return and story 6 reports this one in ``partial[]``.
+        """
         resource = SECTION_RESOURCES[name]
         query = urllib.parse.urlencode(
             {"q": "viewee", "profileUrn": profile_urn, "count": SECTION_PAGE_SIZE}
@@ -752,15 +1058,46 @@ class VoyagerClient:
         try:
             payload = await self._request(f"{resource}?{query}", resource=resource)
         except ApiError as exc:
-            # The typed code is preserved rather than flattened: story 6 wants
-            # to know that languages failed *because of throttling* and not
-            # because the endpoint was withdrawn, and story 8 decides from it
-            # whether a partial answer is honest.
+            if exc.code in SYSTEMIC_CODES:
+                # An expired session, a throttle, or a challenge is a fact
+                # about the ACCOUNT, not about this sub-resource. The other
+                # four are failing for the same reason at the same moment, and
+                # answering 200 with half a profile would be a cheerful lie —
+                # one story 7 would then cache and keep serving. Abort.
+                logger.warning(
+                    "Section %s (%s) hit a systemic %s; aborting the fetch",
+                    name, resource, exc.code,
+                )
+                raise
+            # A genuinely per-section failure. The typed code is preserved
+            # rather than flattened: story 6 wants to know a section is missing
+            # because the endpoint was withdrawn, not merely that it is missing.
             logger.warning(
                 "Section %s (%s) failed: %s", name, resource, exc.log_detail or exc.code
             )
             return SectionFetch(
                 name=name, resource=resource, ok=False, error_code=exc.code
+            )
+
+        if not is_collection_envelope(payload):
+            # A 200 whose body is not a collection is UNREADABLE, not empty.
+            # Counting zero elements out of it and letting story 6 map that to
+            # `[]` states that the profile has none of something that was never
+            # read — the precise absent-versus-unreadable error this story
+            # exists to prevent.
+            logger.warning(
+                "Section %s (%s) returned 200 with a malformed envelope", name, resource
+            )
+            return SectionFetch(
+                name=name, resource=resource, ok=False, error_code="UPSTREAM_ERROR"
+            )
+
+        urns = element_urns(payload)
+        resolved = resolve_elements(payload)
+        if len(resolved) < len(urns):
+            logger.warning(
+                "Section %s (%s) referenced %d elements but included only %d",
+                name, resource, len(urns), len(resolved),
             )
 
         return SectionFetch(
@@ -770,8 +1107,9 @@ class VoyagerClient:
             payload=payload,
             # Recorded independently of `ok`. Zero here means "LinkedIn said
             # zero", which is emphatically not the same as "not retrievable".
-            element_count=len(element_urns(payload)),
+            element_count=len(urns),
             reported_total=reported_total(payload),
+            resolved_count=len(resolved),
         )
 
     # -- The single choke point ----------------------------------------------
@@ -797,14 +1135,31 @@ class VoyagerClient:
             )
         except TransportError as exc:
             raise self._upstream_error(resource, f"transport failed: {self._safe(exc)}")
-        except Exception as exc:  # pragma: no cover - a broken transport
+        except ApiError:
+            raise
+        except Exception as exc:
             # A transport that raises something unexpected must not become a
             # naked 500. CAP-6 permits no unhandled exception to reach a caller.
             raise self._upstream_error(
                 resource, f"transport raised {type(exc).__name__}: {self._safe(exc)}"
             )
 
-        return self._classify(response, resource=resource)
+        try:
+            return self._classify(response, resource=resource)
+        except ApiError:
+            raise
+        except Exception as exc:
+            # Classification is inside the guarantee too, and not
+            # hypothetically: `json.loads` raises `RecursionError` on a deeply
+            # nested body — reachable well under MAX_BODY_BYTES, since nesting
+            # costs one byte per level — and `RecursionError` is not in the
+            # narrow clause `_classify` catches. Guarding only the transport
+            # call left a body LinkedIn could never send but an attacker-
+            # positioned proxy could, turning into a naked 500.
+            raise self._upstream_error(
+                resource,
+                f"classifying the response raised {type(exc).__name__}: {self._safe(exc)}",
+            )
 
     def _classify(self, response: VoyagerResponse, *, resource: str) -> dict[str, Any]:
         """Turn one HTTP response into a payload or a typed error.
@@ -823,24 +1178,34 @@ class VoyagerClient:
            mistaken for an empty profile.
         """
         status = response.status
-        challenge = self._challenge_reason(response)
 
         if status == 429:
             raise self._rate_limited(response, resource)
 
-        if status == LINKEDIN_BOT_STATUS:
-            raise self._challenge(resource, f"status {LINKEDIN_BOT_STATUS}")
-
-        if challenge is not None:
-            raise self._challenge(resource, challenge)
-
         if status in (401, 403):
             # The cookie was presented and refused. Not NO_SESSION — one was
             # supplied — and not UPSTREAM_ERROR, because the caller can fix it.
+            #
+            # THIS MUST STAY ABOVE THE CHALLENGE CHECK. A dead `li_at` is most
+            # often signalled by LinkedIn bouncing the request to the login
+            # page, so the landing URL matches a wall marker and the body is
+            # HTML — every signal a challenge has. Classifying on that first
+            # turns the commonest expiry into UPSTREAM_CHALLENGE, which is
+            # `retryable: true`, which story 7 stale-serves unboundedly. The
+            # caller would then be fed ever-older cached data forever and never
+            # once told to store a new cookie. An explicit refusal outranks the
+            # scenery it was delivered with.
             raise ApiError(
                 "SESSION_EXPIRED",
                 log_detail=f"{resource} returned {status}; LinkedIn refused the session",
             )
+
+        if status == LINKEDIN_BOT_STATUS:
+            raise self._challenge(resource, f"status {LINKEDIN_BOT_STATUS}")
+
+        challenge = self._challenge_reason(response)
+        if challenge is not None:
+            raise self._challenge(resource, challenge)
 
         if status == 404:
             raise ApiError(
@@ -891,7 +1256,10 @@ class VoyagerClient:
             if path.startswith(marker) or path.startswith("/voyager" + marker):
                 return f"redirected to {marker}"
 
-        if response.status == 200 and not response.is_json:
+        if not response.is_json:
+            # Reached only for statuses that are not an explicit refusal — 401
+            # and 403 are already gone by the time this runs — so a non-JSON
+            # body here really is a wall rather than the rendering of a "no".
             return f"content-type {response.content_type.split(';')[0].strip()!r} is not JSON"
         return None
 
@@ -899,7 +1267,7 @@ class VoyagerClient:
         """Throttled. Propagate ``Retry-After`` only when it is a sane integer."""
         headers: dict[str, str] = {}
         retry_after = response.headers.get("retry-after", "").strip()
-        if RETRY_AFTER_RE.match(retry_after):
+        if RETRY_AFTER_RE.match(retry_after) and int(retry_after) > 0:
             headers["Retry-After"] = retry_after
         elif retry_after:
             logger.info("Ignoring unparseable Retry-After from %s", resource)
@@ -968,22 +1336,41 @@ class VoyagerClient:
         """Dig ``publicIdentifier`` out of a ``me`` response.
 
         ``me`` is normalized like everything else: ``data`` holds a
-        ``*miniProfile`` reference and the identifier lives on the entity in
-        ``included``. Both are checked because the shape of ``me`` was not
-        re-verified as carefully as the six that matter.
+        ``*miniProfile`` **reference** and the identifier lives on the entity
+        that reference names, inside ``included``.
+
+        The reference is resolved rather than scanned past. Scanning
+        ``included`` for the first entity carrying any ``publicIdentifier``
+        happens to work when the array holds one entity and silently returns
+        *somebody else* when it holds more — and this function is the entire
+        basis of the live check's safety property, that the one permitted live
+        fetch cannot be aimed at a third party. "Usually the right person" is
+        not a safety property.
         """
         data = payload.get("data")
-        if isinstance(data, Mapping):
-            identifier = data.get("publicIdentifier")
+        if not isinstance(data, Mapping):
+            return None
+
+        # `data` may carry it directly on some shapes; that is unambiguous.
+        identifier = data.get("publicIdentifier")
+        if isinstance(identifier, str) and identifier:
+            return identifier
+
+        reference = data.get("*miniProfile")
+        if not isinstance(reference, str) or not reference:
+            return None
+
+        included = payload.get("included")
+        if not isinstance(included, list):
+            return None
+        for entity in included:
+            if not isinstance(entity, Mapping):
+                continue
+            if entity.get("entityUrn") != reference:
+                continue
+            identifier = entity.get("publicIdentifier")
             if isinstance(identifier, str) and identifier:
                 return identifier
-        included = payload.get("included")
-        if isinstance(included, list):
-            for entity in included:
-                if isinstance(entity, Mapping):
-                    identifier = entity.get("publicIdentifier")
-                    if isinstance(identifier, str) and identifier:
-                        return identifier
         return None
 
 
