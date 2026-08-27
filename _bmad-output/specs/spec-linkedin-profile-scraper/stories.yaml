@@ -1,0 +1,143 @@
+- id: "1"
+  title: Project skeleton, environment config, and local parity
+  description: >-
+    Stand up the FastAPI project, twelve-factor env configuration, and a
+    docker-compose bringing up API, Keycloak, and Postgres. Satisfies CAP-7
+    and the config and secret-hygiene constraints in SPEC.md.
+  invoke_dev_with: >-
+    Commit .env.example with dummy values only; gitignore the real .env.
+    The same image must run locally and deployed with only the env file
+    differing - no environment branching in code. Add the secret-scanning
+    hygiene now (gitignore, pre-commit if cheap) rather than retrofitting
+    it in story 9.
+
+- id: "2"
+  title: Walking-skeleton deploy through the load balancer and nginx
+  description: >-
+    Take a bare /health endpoint all the way to https://shreyaskaushik.dpdns.org
+    through Cloudflare, the OCI load balancer, and host nginx, so every
+    deployment failure mode surfaces on day one. Every later story is then a
+    redeploy against a proven pipeline.
+  done_checkpoint: true
+  invoke_dev_with: >-
+    The instance already exists and is running - deploy for real, do not
+    write scripts to run later. Topology is Cloudflare DNS to OCI load
+    balancer to host nginx to the Docker Compose stack; application
+    containers must never bind directly to public ports. nginx and Docker
+    are host-installed, and the nginx configuration is the only wiring step
+    outside compose. Resolve TLS termination before writing the nginx
+    config - the recommendation on record is Cloudflare proxied with a
+    Cloudflare Origin Certificate at nginx, which avoids Let's Encrypt
+    renewal entirely. Oracle trap to check early: opening 80 and 443 in the
+    Security List is NOT sufficient, because the stock Ubuntu and Oracle
+    Linux images drop those ports in host iptables or firewalld
+    independently - the load balancer health check will fail while every
+    cloud-side setting looks correct. Fix the host firewall as well.
+    Confirm TLS end to end from outside the network before closing this
+    story.
+
+- id: "3"
+  title: Keycloak realm, clients, and JWT validation
+  description: >-
+    Configure the realm with a confidential service-account client and add
+    JWT validation against the realm JWKS in front of the API. Delivers
+    CAP-2 and the evaluator lane in CAP-3.
+  invoke_dev_with: >-
+    The service-account client_credentials lane is the path the evaluator
+    will actually use and must work as two plain curl commands with no
+    browser redirect. Google SSO federation is Should tier, not this story.
+    Reject missing, expired, and foreign-realm tokens with 401 per
+    response-schema.md. Export the realm config into the repo so a local
+    run reproduces it.
+
+- id: "4"
+  title: Voyager client returning raw profile JSON
+  description: >-
+    Authenticate to LinkedIn's internal Voyager endpoints with an li_at
+    session and return raw JSON for a known profile. The retrieval half of
+    CAP-1, before any schema mapping.
+  invoke_dev_with: >-
+    Voyager endpoints are unversioned and undocumented; capture the exact
+    request shape - headers, csrf token handling, cookie form - in code
+    comments, because story 9's approach section depends on it. Keep the
+    raw payload accessible during development; story 6 maps from it.
+    Do not parse rendered HTML.
+
+- id: "5"
+  title: Encrypted per-user LinkedIn session vault
+  description: >-
+    Implement PUT and GET /api/v1/session with encryption at rest, binding
+    each stored li_at to the caller's Keycloak subject. Delivers CAP-4.
+  spec_checkpoint: true
+  invoke_dev_with: >-
+    Security-sensitive: the encryption key comes from an env var and is
+    never committed. GET must return presence and last-use validity only,
+    never the stored cookie value under any flag or debug mode. A stored
+    session must be recoverable only by the subject that supplied it.
+    Keep the cookie value out of logs, traces, and error bodies.
+    PUT replaces any stored session outright; there is no delete or revoke
+    endpoint in the Must tier - overwrite is the entire lifecycle.
+
+- id: "6"
+  title: Profile extraction and response schema mapping
+  description: >-
+    Map raw Voyager output onto the full response contract in
+    response-schema.md across every assignment field. Completes CAP-1 and
+    is the graded core of the submission.
+  done_checkpoint: true
+  invoke_dev_with: >-
+    Absent-versus-unreadable is load-bearing and easy to get wrong: fields
+    genuinely missing from the profile are null or empty array; fields
+    present but not retrievable are omitted entirely and named in the
+    top-level partial[] array. Dates keep the granularity LinkedIn actually
+    exposes - YYYY-MM for experience and certifications, YYYY for education
+    - and are never widened into full timestamps. Test against a profile
+    with sparse sections, not just a complete one.
+
+- id: "7"
+  title: Response cache with stale-serve
+  description: >-
+    Cache every successful fetch and serve the last good record flagged
+    stale when a live call fails. Delivers CAP-5, the primary resilience
+    story for evaluation day.
+  invoke_dev_with: >-
+    fetched_at is the time the profile was retrieved from LinkedIn, not the
+    time the request was served - on a stale response it is the older
+    timestamp, which is what makes staleness actionable. Stale-serve takes
+    precedence over the retryable errors: with a cached record present,
+    RATE_LIMITED, UPSTREAM_CHALLENGE and UPSTREAM_ERROR become 200 with
+    stale true. Stale-serve is unbounded by decision: cached records have no
+    TTL and are never evicted, so a record of any age is served in
+    preference to a retryable error - do not add expiry. Postgres is
+    already present for Keycloak and is the assumed store.
+
+- id: "8"
+  title: Error taxonomy and handlers
+  description: >-
+    Implement the typed error envelope and status mapping from
+    response-schema.md across every failure path. Delivers CAP-6.
+  invoke_dev_with: >-
+    No unhandled exception may reach the client. 428 is deliberate for
+    NO_SESSION and SESSION_EXPIRED - the caller has a fixable missing
+    precondition and the status should say so. Set the retryable flag
+    honestly so a client can decide without parsing prose, and set
+    Retry-After on RATE_LIMITED when upstream tells you a value.
+
+- id: "9"
+  title: README, secret-history audit, and final deploy
+  description: >-
+    Write the four required README sections, verify no secret exists
+    anywhere in git history, and redeploy the finished service. Delivers
+    CAP-8 and closes the submission.
+  done_checkpoint: true
+  invoke_dev_with: >-
+    The README needs all four sections the assignment names - setup, API
+    documentation, approach, known limitations. Point API documentation at
+    the generated OpenAPI document. The limitations section must name the
+    specific failure modes from the adopted addendum - session expiry,
+    rate limiting and challenge pages, Voyager schema drift, and the
+    LinkedIn terms-of-service position - not generic caveats; a candid
+    treatment is expected to score better than a minimised one. Include
+    the two evaluator curl commands verbatim and verify them against the
+    deployed URL from a machine that has never authenticated. Audit the
+    full git history for secrets, not just the working tree.
