@@ -137,17 +137,27 @@ answered with 401 and the typed error body:
 {"error": {"code": "UNAUTHENTICATED", "message": "Missing or invalid bearer token.", "retryable": false}}
 ```
 
-One message for every rejection reason, deliberately: the specific reason is in
-the API container's logs, where an operator can read it and a prober cannot.
-Any path under `/api/v1` answers this, whether or not the path exists — a `404`
-for an unknown route and a `401` for a real one would let anyone map this API's
-surface without presenting a token.
+One message for every *rejection*, deliberately: whether your token was expired,
+foreign-realm or simply absent, the 401 says the same thing, and the specific
+reason is in the API container's logs where an operator can read it and a prober
+cannot. That uniformity is about the 401 body and nothing else — this service
+does not otherwise try to be uninformative, and the paragraph below is an
+example of it being deliberately informative instead.
 
 **A 401 is always about your token.** If *this service* cannot reach Keycloak to
 read the realm's signing keys, you get a `502 UPSTREAM_ERROR` with
 `"retryable": true` instead, because your token was never checked and telling
 you to stop trying would be a claim about a credential nobody looked at. Tokens
-already validated against a cached key set keep working through the outage.
+already validated against a cached key set keep working through the outage. The
+message names the identity provider rather than LinkedIn, which the status code
+would have given away regardless.
+
+Every path under `/api/v1` answers that same 401 without a token, whether or not
+the path exists. That is for the caller's benefit, not for concealment: someone
+who forgot their token gets told they forgot their token, instead of a `404`
+about a route that is sitting right there. It is **not** an attempt to hide
+which routes exist — `/openapi.json` is unauthenticated and lists every one of
+them, by design, because it is this API's documentation.
 
 ```bash
 docker compose logs api | grep "Rejected request"

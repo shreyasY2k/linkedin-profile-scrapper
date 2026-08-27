@@ -45,7 +45,12 @@ from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.auth import require_claims
-from app.errors import ApiError, ErrorEnvelope, error_responses
+from app.errors import (
+    IDP_UNAVAILABLE_RESPONSE,
+    ApiError,
+    ErrorEnvelope,
+    error_responses,
+)
 from app.linkedin.client import VoyagerClient
 from app.vault import SessionState, SessionVault
 from app.vault import vault as _process_vault
@@ -237,18 +242,12 @@ SESSION_ERRORS: dict[int | str, dict[str, Any]] = {
     # A 502 from a session route is never about LinkedIn: neither handler's
     # ANSWER depends on it (`PUT` stores first and verifies best-effort, and a
     # verification that cannot reach a verdict leaves `last_use_ok` null rather
-    # than failing). It is the authentication boundary — the identity provider
-    # could not be reached to validate the token. Retryable, and stated here
-    # because the router-level entry would otherwise be the only mention and
-    # would read as though LinkedIn were involved.
-    502: {
-        "model": ErrorEnvelope,
-        "description": (
-            "`UPSTREAM_ERROR` — the identity provider could not be reached to "
-            "validate the token. Retryable; your token is not being refused, "
-            "and your stored session is untouched."
-        ),
-    },
+    # than failing). It is the authentication boundary.
+    #
+    # Reused, not restated. A route-level entry replaces the router-level one
+    # for the same status, so this has to be here — but writing the sentence a
+    # second time is how the two come to say different things.
+    **IDP_UNAVAILABLE_RESPONSE,
 }
 
 

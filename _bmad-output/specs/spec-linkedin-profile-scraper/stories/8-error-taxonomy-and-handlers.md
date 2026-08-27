@@ -90,8 +90,9 @@ Read-only contract: `_bmad-output/specs/spec-linkedin-profile-scraper/response-s
   named `cause` under the client's bullet; it is declared on `ApiError` in
   `app/errors.py` because that is where `log_detail` lives and the two are the
   same kind of thing — operator-only, never in a body. The vocabulary
-  (`CAUSE_*`, `DECORATION_RETRY_CAUSES`) stays in `app/linkedin/client.py`,
-  since the values are that module's domain.
+  (`CAUSE_*`, `ERROR_CAUSES`) lives there too and is validated the way `code` is
+  validated against `ERROR_SPECS`; only `DECORATION_RETRY_CAUSES`, which is a
+  policy rather than a vocabulary, stays in `app/linkedin/client.py`.
 
 - **The `me` split is by challenge *reason*, not by every challenge branch.** A
   wall — a redirect to `/authwall`, `/checkpoint`, `/login`, or a non-JSON body
@@ -147,3 +148,67 @@ Read-only contract: `_bmad-output/specs/spec-linkedin-profile-scraper/response-s
 - `docker run --rm lps-test python -m pytest -q -k "envelope or retryable or classify or mismatch"` — expected: the new parametrized assertions pass across all eight codes
 - `docker compose up -d --wait && curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/api/v1/nope` — expected: `401`
 - `docker run --rm lps-test python -c "import app.main"` — expected: clean import, handlers install
+
+### Review pass 1
+
+Fourteen findings, all applied. Six changed behaviour:
+
+- **The `400: BAD_REQUEST` fallback row is restored.** Dropping it was this
+  story's one deliberate deletion and the reasoning was wrong: "every 400 is now
+  `INVALID_URL`" held for every 400 this codebase *raises* and not for FastAPI's
+  own body-read guard, which raises `HTTPException(400)` before any of our code
+  runs. Reproduced as `PUT /api/v1/session` with `b"\xff\xfe\xff"` rendering
+  `code: "INTERNAL_ERROR"` at a 400. A test now drives an unparseable body
+  through a real route. **`FALLBACK_CODES` is unchanged from its pre-story
+  contents**; the task-list bullet asking it to shrink is answered by "no row was
+  superseded", which is a finding rather than an omission.
+
+- **An unknown `kid` is a 401 again when a refresh fails underneath it.** The
+  post-fetch branch required the refresh *this call made* to have succeeded, so
+  with keys held and an unusable refetch an unknown `kid` answered 502 — then
+  401 for the same token thirty seconds later, once the refresh floor suppressed
+  the refetch. That contradicted the method's own docstring and the matrix row
+  "unknown signing key → 401, must not regress into a 502". Both exits now ask
+  the one question the docstring states: are keys held? `_install`'s bool return
+  went with it, unread.
+
+- **The catch-all matches on path alone.** A declared method set left every verb
+  outside it — `TRACE`, and anything invented — falling through to Starlette's
+  405, whose `Allow` header then named exactly which methods each real route
+  answered. Both of Starlette's method checks had to go (`matches` *and*
+  `handle`, which re-checks and raises its own 405).
+
+- **`/api/v1` and trailing slashes.** The bare prefix answered `307` to
+  unauthenticated callers, since a `{path:path}` converter needs the separating
+  slash; it has its own catch-all route now. And `GET /api/v1/profile/` had
+  regressed from `307` to a hard `404` because the catch-all full-matches and
+  `redirect_slashes` never runs — the redirect is reconstructed rather than
+  documented as a loss, since a client-visible break is not an acceptable side
+  effect of an error-shape change.
+
+- **A curated message beats `exc.detail`.** Starlette always populates `detail`,
+  so `FALLBACK_MESSAGES` was dead code that looked alive — and the entry that
+  reached callers most often was FastAPI's "There was an error parsing the
+  body", a framework internal at a status the caller is meant to act on.
+
+- **`WWW-Authenticate` belongs to the `UNAUTHENTICATED` row.** `ApiError`
+  applies it to every 401 it renders; a call site with something more specific
+  (`error="invalid_token"`) still wins.
+
+And the reframe: **this service does not claim enumeration resistance.**
+`/openapi.json` is unauthenticated and publishes every route, story 9 ships it as
+the API documentation, and the body-parsing leak (a malformed body answers 400
+where an absent path answers 401) is accepted and logged. The catch-all's
+docstrings, the comments around it and the README now claim what is true — one
+error envelope and one status for every unauthenticated request under the prefix
+— rather than concealment.
+
+**On the IdP 502's message, a choice was required and the README moved.** The
+message names the identity provider rather than LinkedIn, which contradicted the
+README's "one message for every rejection reason". Genericising it would have
+hidden nothing — the 502 status gives the same fact away — so the message stands
+and the README claim is now scoped to what it was always about: the *401* body.
+
+`response-schema.md` gained one approved sentence: the `Retryable` column is
+each code's default, and the value on the wire is authoritative. The
+hand-transcribed pinning test is still green and still unmodified.

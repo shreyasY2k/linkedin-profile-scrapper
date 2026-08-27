@@ -28,6 +28,7 @@ import email.message
 import io
 import json
 import logging
+import socket
 import threading
 import urllib.error
 import urllib.request
@@ -38,7 +39,7 @@ from typing import Any, Callable
 
 import pytest
 
-from app.errors import ERROR_SPECS, ApiError
+from app.errors import ERROR_CAUSES, ERROR_SPECS, ApiError
 from app.linkedin import client as voyager
 from app.linkedin.client import (
     CORE_RESOURCE,
@@ -1492,6 +1493,29 @@ def test_only_a_refused_decoration_earns_the_second_call(
     assert cause in voyager.DECORATION_RETRY_CAUSES
 
 
+def test_a_bug_in_this_client_does_not_buy_the_second_call() -> None:
+    """`client-bug`, and why it is not `malformed-body`.
+
+    When `_classify` itself raises — a `RecursionError` on a deeply nested body,
+    or any bug in this file — the response was tagged as a malformed body, which
+    is IN the retry whitelist. So an internal fault bought the extra live call
+    the whitelist exists to prevent, and did it against an account that was
+    already producing an error. It is not evidence that LinkedIn sent anything
+    at all, let alone that the decoration was refused.
+    """
+    # A body no LinkedIn edge would send but an attacker-positioned proxy could:
+    # nesting costs one byte per level, so `RecursionError` out of `json.loads`
+    # is reachable well under MAX_BODY_BYTES — and it is not in the narrow
+    # clause `_classify` catches.
+    client = make_client(override("core", status_response(200, body=b"[" * 200_000)))
+
+    error = expect_api_error(lambda: fetch(client))
+
+    assert error.code == "UPSTREAM_ERROR"
+    assert error.cause == voyager.CAUSE_CLIENT_BUG
+    assert len(core_calls(client)) == 1, "a bug here must not spend a second call"
+
+
 def test_the_causes_that_earn_a_retry_are_a_closed_set() -> None:
     """Adding a cause to the retry must be a deliberate act.
 
@@ -1507,6 +1531,10 @@ def test_the_causes_that_earn_a_retry_are_a_closed_set() -> None:
     assert voyager.CAUSE_TRANSPORT not in voyager.DECORATION_RETRY_CAUSES
     assert voyager.CAUSE_UNEXPECTED_STATUS not in voyager.DECORATION_RETRY_CAUSES
     assert voyager.CAUSE_MEMBER_MISMATCH not in voyager.DECORATION_RETRY_CAUSES
+    assert voyager.CAUSE_CLIENT_BUG not in voyager.DECORATION_RETRY_CAUSES
+    # Every member is a registered cause, so the whitelist cannot contain a
+    # value no raise site can ever produce.
+    assert voyager.DECORATION_RETRY_CAUSES <= ERROR_CAUSES
 
 
 def test_an_unknown_profile_is_not_retried_undecorated() -> None:
@@ -1993,6 +2021,50 @@ def test_the_cookie_name_is_handled_only_inside_the_client() -> None:
         "error body."
     )
     assert "app/linkedin/client.py" in handlers, "the client must still be the one that does"
+
+
+def test_the_client_calls_the_modules_transport_not_one_bound_at_import() -> None:
+    """The bug that had this suite fetching the real linkedin.com for two stories.
+
+    `transport: Transport = urllib_transport` binds the function OBJECT when the
+    `def` executes, so a test replacing `client.urllib_transport` on the module
+    changed nothing — and the substitute simply never ran. Nothing failed: the
+    live response classified as the code the assertion expected.
+
+    Asserted directly, because "the default is resolved at construction" is
+    invisible from every test that passes a transport explicitly, which is all
+    of the others.
+    """
+    calls: list[str] = []
+
+    def recording(url: str, headers: dict[str, str], timeout: float) -> VoyagerResponse:
+        calls.append(url)
+        return json_response(load_fixture("voyager_me.json"), url="https://www.linkedin.com/voyager/api/me")
+
+    original = voyager.urllib_transport
+    voyager.urllib_transport = recording
+    try:
+        asyncio.run(VoyagerClient(SENTINEL_COOKIE).check_session())
+    finally:
+        voyager.urllib_transport = original
+
+    assert calls, "the client used a transport bound at import, not the module's"
+
+
+def test_the_suite_cannot_open_a_real_connection() -> None:
+    """The durable guard behind the test above, proved to actually bite.
+
+    An autouse fixture in `tests/conftest.py` refuses real sockets. A guard that
+    silently matched nothing would be worse than none, since it would be cited
+    as the reason not to look again.
+    """
+    from tests.conftest import NetworkUseInTests
+
+    with pytest.raises(NetworkUseInTests):
+        socket.create_connection(("linkedin.com", 443), timeout=0.01)
+
+    with pytest.raises(NetworkUseInTests):
+        socket.socket().connect(("linkedin.com", 443))
 
 
 def test_the_client_never_reads_configuration() -> None:

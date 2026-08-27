@@ -138,6 +138,62 @@ ERROR_SPECS: dict[str, ErrorSpec] = {
 }
 
 
+# --- What an UPSTREAM_ERROR (or any collapsed code) actually was ----------------
+#
+# `response-schema.md` has one row for "any other upstream failure", and it is
+# right to: a caller can do nothing different with a 400, a 410, an unexpected
+# status or an unparseable body. This service can, and `cause` is how it tells
+# them apart WITHOUT adding rows the contract does not have. Operator-only, like
+# `log_detail`, and never in a body.
+#
+# Declared here rather than in `app/linkedin/client.py` for one reason: a cause
+# is compared for membership (`DECORATION_RETRY_CAUSES`), so a one-character
+# drift would silently drop a case out of a whitelist and nothing would say so.
+# Validated in `ApiError` exactly the way `code` is validated against
+# `ERROR_SPECS` — an unknown cause is a KeyError at the raise site, not a
+# mystery six weeks later.
+
+#: LinkedIn refused the request as malformed. What a withdrawn or revised
+#: ``decorationId`` looks like.
+CAUSE_BAD_REQUEST = "bad-request"
+#: The endpoint is gone. Also what a withdrawn decoration looks like.
+CAUSE_GONE = "gone"
+#: A 200 whose body is not the collection envelope the client can read — an
+#: unparseable body, a non-object payload, a missing ``*elements``.
+CAUSE_MALFORMED_BODY = "malformed-body"
+#: Any other status. A 500 or a 503 is a fact about LinkedIn, not about the
+#: request that was sent.
+CAUSE_UNEXPECTED_STATUS = "unexpected-status"
+#: The call never completed: DNS, TLS, connection reset, timeout.
+CAUSE_TRANSPORT = "transport"
+#: The response was readable and describes a different member than the one
+#: asked for. The one cause that is also **not retryable**.
+CAUSE_MEMBER_MISMATCH = "member-mismatch"
+#: **This codebase** raised, not LinkedIn. A classifier that threw, a fan-out
+#: task that died. Kept distinct because it is emphatically not evidence that
+#: anything about the request was wrong, and must never buy a retry.
+CAUSE_CLIENT_BUG = "client-bug"
+#: The identity provider could not be reached to validate a token.
+CAUSE_IDP_UNREACHABLE = "idp-unreachable"
+#: The profile fetch as a whole exceeded its deadline.
+CAUSE_DEADLINE = "deadline"
+
+#: Every value ``ApiError.cause`` may take. A raise site inventing one fails.
+ERROR_CAUSES: frozenset[str] = frozenset(
+    {
+        CAUSE_BAD_REQUEST,
+        CAUSE_GONE,
+        CAUSE_MALFORMED_BODY,
+        CAUSE_UNEXPECTED_STATUS,
+        CAUSE_TRANSPORT,
+        CAUSE_MEMBER_MISMATCH,
+        CAUSE_CLIENT_BUG,
+        CAUSE_IDP_UNREACHABLE,
+        CAUSE_DEADLINE,
+    }
+)
+
+
 #: Every error this API returns is uncacheable, and that is a correctness rule
 #: rather than a performance one.
 #:
@@ -155,6 +211,14 @@ ERROR_SPECS: dict[str, ErrorSpec] = {
 #: raised in a dependency, Starlette's own 404 and 405, a validation 422, and
 #: the last-resort 500 all render through this module and inherit it.
 NO_STORE = {"Cache-Control": "no-store"}
+
+#: RFC 6750 requires a challenge on a 401 from a bearer-token resource, so it is
+#: a property of the ``UNAUTHENTICATED`` row rather than of one helper that
+#: happens to remember it. `ApiError` applies it to every 401 it renders; a call
+#: site with something more specific to say (``error="invalid_token"``, on a
+#: credential that was actually presented and rejected) passes its own and wins.
+WWW_AUTHENTICATE = "WWW-Authenticate"
+DEFAULT_CHALLENGE = "Bearer"
 
 
 def _uncacheable(headers: Mapping[str, str] | None) -> dict[str, str]:
@@ -211,7 +275,9 @@ class ApiError(Exception):
     an unparseable body into one ``UPSTREAM_ERROR``; ``cause`` says which,
     so the decorated-core retry can fire for a refused decoration and not for a
     LinkedIn outage. Like ``log_detail`` it is **operator-only** and never
-    reaches a client-facing body.
+    reaches a client-facing body — and like ``code`` it is checked against a
+    closed set (:data:`ERROR_CAUSES`), because it is compared for membership and
+    a typo would otherwise drop a case out of a whitelist in silence.
     """
 
     def __init__(
@@ -235,8 +301,23 @@ class ApiError(Exception):
                 "that cannot succeed is how a permanent failure — a dead session "
                 "above all — ends up hidden behind a stale cached answer."
             )
+        if cause is not None and cause not in ERROR_CAUSES:
+            raise KeyError(
+                f"{cause!r} is not in ERROR_CAUSES. A cause is compared for "
+                "membership — `DECORATION_RETRY_CAUSES` is a whitelist — so an "
+                "unregistered one would silently mean 'not that case'."
+            )
         self.message = message or self.spec.message
         self.headers = dict(headers) if headers else None
+        if self.spec.status_code == 401:
+            # RFC 6750, applied to the row rather than remembered per call site.
+            # `ApiError("UNAUTHENTICATED")` raised anywhere — including by a
+            # route that never heard of `unauthenticated()` — is a conformant
+            # 401, and a caller that reads the challenge to decide whether to
+            # re-authenticate gets one every time.
+            self.headers = self.headers or {}
+            if not any(name.lower() == WWW_AUTHENTICATE.lower() for name in self.headers):
+                self.headers[WWW_AUTHENTICATE] = DEFAULT_CHALLENGE
         #: ``None`` means "whatever the table says". Read through
         #: :attr:`retryable`, never directly.
         self._retryable_override = retryable
@@ -315,15 +396,19 @@ def unauthenticated(
 # itself — a path with no route at all can still 404, and that 404 still has
 # to wear the envelope.
 #
-# Story 8 dropped exactly one row, `400: BAD_REQUEST`. Every 400 this API can
-# answer is now `INVALID_URL` from the profile route — a real taxonomy code with
-# a real meaning — so the fallback row could only ever have fired for a 400
-# nothing raises, and keeping a code around for a status the taxonomy owns is
-# how the fallback set drifts back into being a second, worse taxonomy. The
-# other four rows are NOT superseded and stay: 404 and 405 are reachable with no
-# route at all, 422 is request validation, and 503 is this service's own
-# datastore, which `response-schema.md` has no row for by design.
+# Story 8 dropped no row, and the 400 is why. It looked superseded — every 400
+# this API *raises* is `INVALID_URL` from the profile route — and removing it was
+# reproduced as a live regression: FastAPI raises `HTTPException(400, "There was
+# an error parsing the body")` from its own body-read guard
+# (`fastapi/routing.py`), so `PUT /api/v1/session` with an unparseable body
+# rendered `code: "INTERNAL_ERROR"` at a 400. That is the fallback's whole job —
+# statuses reachable without any route or any raise site of ours agreeing to
+# them — and "nothing raises this" is exactly the reasoning it exists to
+# distrust. Every row here stays until something proves the status unreachable,
+# which is a proof about a framework's internals rather than about this code.
 FALLBACK_CODES: dict[int, str] = {
+    # FastAPI's body-read guard, not ours. See above.
+    400: "BAD_REQUEST",
     404: "NOT_FOUND",
     405: "METHOD_NOT_ALLOWED",
     422: "INVALID_REQUEST",
@@ -342,6 +427,9 @@ FALLBACK_CODE = "INTERNAL_ERROR"
 #: is a pydantic dump that can echo a submitted LinkedIn session cookie back
 #: into the response body.
 FALLBACK_MESSAGES: dict[int, str] = {
+    # Deliberately ours rather than FastAPI's "There was an error parsing the
+    # body", which names a framework internal to a caller who cannot act on it.
+    400: "The request could not be understood.",
     404: "No such resource.",
     405: "That method is not allowed on this resource.",
     422: "The request failed validation.",
@@ -400,12 +488,26 @@ async def api_error_handler(request: Request, exc: Exception) -> JSONResponse:
 
 
 async def http_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    """Render Starlette's own 404/405/redirect-slash errors as the envelope."""
+    """Render Starlette's own 400/404/405/redirect-slash errors as the envelope.
+
+    **A curated message wins over ``exc.detail``.** Starlette always populates
+    `detail` — with "Not Found", "Method Not Allowed", or FastAPI's "There was
+    an error parsing the body" — so preferring it made every entry in
+    :data:`FALLBACK_MESSAGES` dead code that looked alive. Worse, the one that
+    reached a caller most often named a framework internal at a status the
+    caller was supposed to be able to act on.
+
+    So a status this module has written a message for uses that message, and
+    `detail` is the fallback for the statuses it has not — which is what keeps
+    an unforeseen `HTTPException(501)` from losing the only description it has.
+    `detail` is written by this codebase or by Starlette and never by the
+    caller, so surfacing it there is safe; it is used only when it is a plain
+    string.
+    """
     if not isinstance(exc, StarletteHTTPException):  # pragma: no cover
         raise TypeError(f"http_exception_handler received {type(exc).__name__}")
-    # `exc.detail` is written by this codebase or by Starlette, never by the
-    # caller, so it is safe to surface — but only when it is a plain string.
-    message = exc.detail if isinstance(exc.detail, str) and exc.detail else None
+    detail = exc.detail if isinstance(exc.detail, str) and exc.detail else None
+    message = None if exc.status_code in FALLBACK_MESSAGES else detail
     return envelope(exc.status_code, message=message, headers=exc.headers)
 
 
@@ -498,18 +600,24 @@ UNAUTHENTICATED_RESPONSE: dict[int | str, dict[str, Any]] = {
 #: `retryable: true`, and it is reachable from every route under `/api/v1`,
 #: which is why it is attached at the router beside the 401 rather than
 #: enumerated per route.
+#: The prose, separately, because a route-level `responses` entry for 502
+#: REPLACES the router-level one rather than merging with it — FastAPI merges by
+#: status key. A route that documents its own 502 must therefore restate this
+#: meaning, and restating it by hand is how the two drift apart.
+IDP_UNAVAILABLE_DESCRIPTION = (
+    "A 502 is also how the authentication boundary answers when the identity "
+    "provider could not be reached to validate the token: retryable, and the "
+    "token is not being refused."
+)
+
 IDP_UNAVAILABLE_RESPONSE: dict[int | str, dict[str, Any]] = {
-    502: {
-        "model": ErrorEnvelope,
-        "description": (
-            "`UPSTREAM_ERROR` — the identity provider could not be reached to "
-            "validate the token. Retryable; the token is not being refused."
-        ),
-    }
+    502: {"model": ErrorEnvelope, "description": IDP_UNAVAILABLE_DESCRIPTION}
 }
 
 
-def error_responses(*codes: str) -> dict[int | str, dict[str, Any]]:
+def error_responses(
+    *codes: str, addenda: Mapping[int, str] | None = None
+) -> dict[int | str, dict[str, Any]]:
     """OpenAPI ``responses`` fragment for the taxonomy codes a route can answer.
 
     Built from :data:`ERROR_SPECS` rather than written per route, so the status
@@ -526,6 +634,15 @@ def error_responses(*codes: str) -> dict[int | str, dict[str, Any]]:
     with no codes returned ``{}``, so a route asking to document its failures
     silently documented none — the exact outcome the helper exists to prevent,
     reached by a typo.
+
+    ``addenda`` appends prose to the entry for one status, for the thing the
+    taxonomy cannot say by itself: that a status means something on THIS route
+    which the code's own message does not cover. It is a parameter rather than a
+    caller mutating the returned dict in place, because a status keyed into a
+    result and mutated at module scope raises ``KeyError`` at import the moment
+    the code producing it is dropped from the call above — a broken deploy for
+    an edit to a docstring. Here the same mistake is a ``KeyError`` naming the
+    status, raised from the one function that knows which statuses exist.
     """
     if not codes:
         raise ValueError(
@@ -548,5 +665,16 @@ def error_responses(*codes: str) -> dict[int | str, dict[str, Any]]:
         line = f"`{code}` — {spec.message}"
         entry["description"] = (
             f"{entry['description']} {line}".strip() if entry["description"] else line
+        )
+
+    for status, addendum in (addenda or {}).items():
+        if status not in merged:
+            raise KeyError(
+                f"there is no {status} entry to append to — the codes given "
+                f"({', '.join(codes)}) produce {sorted(merged)}. A route cannot "
+                "document a meaning for a status it does not answer."
+            )
+        merged[status]["description"] = (
+            f"{merged[status]['description']} {addendum}".strip()
         )
     return merged

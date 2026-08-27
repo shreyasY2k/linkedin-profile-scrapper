@@ -33,6 +33,7 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import APIRouter, Depends
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from app import auth
@@ -41,7 +42,13 @@ from app.api import v1
 from app.api.v1 import router as v1_router
 from app.auth import require_claims
 from app.config import settings
-from app.errors import ApiError
+from app.errors import (
+    CAUSE_MALFORMED_BODY,
+    CAUSE_MEMBER_MISMATCH,
+    IDP_UNAVAILABLE_DESCRIPTION,
+    ApiError,
+    unauthenticated,
+)
 from app.main import create_app
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -722,6 +729,52 @@ def test_an_unreachable_jwks_still_refuses_while_the_refresh_floor_holds(
     _assert_envelope(second, 502, retryable=True)
 
 
+def test_an_unknown_kid_stays_a_401_when_a_refresh_fails_underneath_it() -> None:
+    """Keys held + a refetch that comes back unusable + an unknown `kid` = 401.
+
+    The discriminator is "do we hold a key set we could have checked this kid
+    against", and an earlier revision also required the refresh THIS CALL made
+    to have succeeded. With keys held and a failing refetch, an unknown kid then
+    answered 502 — and 401 for the identical token thirty seconds later, once
+    the refresh floor stopped it refetching. `response-schema.md`'s matrix says
+    an unknown signing key is a 401 and must not regress into a 502; a verdict
+    that depends on which side of a refresh window a request lands on is not a
+    verdict at all.
+    """
+    fetcher = RecordingFetcher()
+    cache = _always_refreshing(fetcher)
+
+    assert cache.signing_key(REALM_KID) is not None
+    fetcher.error = OSError("connection refused")
+
+    with pytest.raises(auth.SigningKeyUnavailable):
+        cache.signing_key("never-published")
+    assert fetcher.calls == 2, "the failing refresh under test never happened"
+
+
+def test_the_answer_for_an_unknown_kid_does_not_change_across_the_refresh_floor() -> None:
+    """The timing dependency, stated as the property it violates.
+
+    Same cache, same token, one call that refetches and one the floor
+    suppresses. Both must raise the same class, or the same request gets two
+    different HTTP statuses depending on when it arrives.
+    """
+    fetcher = RecordingFetcher()
+    cache = auth.JwksCache(auth.JWKS_URL, fetcher=fetcher, min_refresh_interval_seconds=3600)
+
+    assert cache.signing_key(REALM_KID) is not None
+    fetcher.error = OSError("connection refused")
+
+    with pytest.raises(Exception) as refreshing:
+        cache.signing_key("never-published")
+    with pytest.raises(Exception) as suppressed:
+        cache.signing_key("never-published")
+
+    assert fetcher.calls == 1, "the floor must have suppressed the second fetch"
+    assert type(refreshing.value) is auth.SigningKeyUnavailable
+    assert type(refreshing.value) is type(suppressed.value)
+
+
 def test_a_key_set_that_arrived_still_refuses_an_unknown_kid_as_a_401(
     client: TestClient, fetcher: RecordingFetcher
 ) -> None:
@@ -1211,21 +1264,66 @@ def test_the_fallback_codes_are_not_mistaken_for_taxonomy_rows() -> None:
     assert FALLBACK_CODE not in ERROR_SPECS
 
 
-def test_the_fallback_no_longer_carries_a_code_the_taxonomy_owns() -> None:
-    """Story 8 shrank the set by exactly one row, and only that one.
+def test_the_fallback_covers_every_status_reachable_without_a_raise_site() -> None:
+    """Story 8 dropped the 400 row and had to put it back. That is the test.
 
-    Every 400 this API can answer is `INVALID_URL`, a real code with a real
-    meaning, so a `BAD_REQUEST` fallback could only ever have fired for a 400
-    nothing raises. The other four rows are NOT superseded and deleting any of
-    them would put a naked `{"detail": ...}` back on a reachable path — which
-    is the failure the whole fallback exists to prevent, and which the story's
-    boundaries forbid.
+    The reasoning for dropping it — "every 400 this API answers is now
+    `INVALID_URL`" — was true of every 400 *this codebase raises* and false of
+    the ones it does not: FastAPI's own body-read guard raises
+    `HTTPException(400, ...)` before any of our code runs. "Nothing raises this
+    status" is precisely the argument the fallback set exists to distrust, and
+    a row is not superseded by a taxonomy code merely because one path now has
+    one.
     """
     from app.errors import FALLBACK_CODES, FALLBACK_MESSAGES
 
-    assert 400 not in FALLBACK_CODES
-    assert 400 not in FALLBACK_MESSAGES
-    assert set(FALLBACK_CODES) == {404, 405, 422, 503}
+    assert set(FALLBACK_CODES) == {400, 404, 405, 422, 503}
+    assert set(FALLBACK_MESSAGES) == set(FALLBACK_CODES)
+
+
+def test_an_unparseable_body_is_a_typed_400_and_not_an_internal_error(
+    fetcher: RecordingFetcher,
+) -> None:
+    """The regression itself, driven through a real route.
+
+    FastAPI reads the body before any dependency runs, so bytes that are not
+    UTF-8 become `HTTPException(400, "There was an error parsing the body")`
+    from `fastapi/routing.py`. Without a 400 row that rendered
+    `code: "INTERNAL_ERROR"` — telling a caller their own malformed request was
+    a bug in this service, at a status that says the opposite.
+
+    Asserted on the wire rather than against the constant, because the constant
+    is not what was broken: the routing of a status to it was.
+    """
+    client = TestClient(create_app(), raise_server_exceptions=False)
+
+    response = client.put(
+        "/api/v1/session",
+        content=b"\xff\xfe\xff",
+        headers={**bearer(make_token()), "Content-Type": "application/json"},
+    )
+
+    _assert_envelope(response, 400, retryable=False)
+    assert response.json()["error"]["code"] == "BAD_REQUEST"
+    # And never FastAPI's own text, which names a framework internal.
+    assert "parsing the body" not in response.text
+
+
+def test_a_curated_message_wins_over_starlettes_own_detail(client: TestClient) -> None:
+    """`FALLBACK_MESSAGES` was dead code that looked alive.
+
+    Starlette always populates `detail` and the handler preferred it, so every
+    curated message was unreachable — including the 400 one, whose whole point
+    is not to hand a caller "There was an error parsing the body".
+    """
+    from app.errors import FALLBACK_MESSAGES
+
+    assert client.get("/no/such/path").json()["error"]["message"] == (
+        FALLBACK_MESSAGES[404]
+    )
+    assert client.post(PROBE_PATH, headers=bearer(make_token())).json()["error"][
+        "message"
+    ] == FALLBACK_MESSAGES[405]
 
 
 # --- Every taxonomy code, on the wire -----------------------------------------
@@ -1274,6 +1372,60 @@ def test_every_taxonomy_code_wears_the_envelope_on_the_wire(
     # Every error is caller-specific and none of them may be cached by the
     # nginx / load balancer / Cloudflare chain in front of this service.
     assert response.headers["cache-control"] == "no-store"
+    if spec.status_code == 401:
+        # RFC 6750 requires the challenge on every 401 from a bearer resource,
+        # so it belongs to the row rather than to the one helper that used to
+        # remember it — `ApiError("UNAUTHENTICATED")` raised by a route that
+        # never heard of `unauthenticated()` is still conformant.
+        assert response.headers["www-authenticate"] == "Bearer"
+
+
+def test_a_call_site_with_a_more_specific_challenge_still_wins(
+    fetcher: RecordingFetcher,
+) -> None:
+    """The default must not overwrite `error="invalid_token"`.
+
+    RFC 6750 puts that parameter on a *presented and rejected* credential, and
+    `unauthenticated()` sets it for exactly that case. A default that clobbered
+    it would make every 401 claim a token was presented.
+    """
+    response = _raise_over_http(
+        unauthenticated(log_detail="test", www_authenticate='Bearer error="invalid_token"')
+    )
+
+    assert response.headers["www-authenticate"] == 'Bearer error="invalid_token"'
+
+
+def test_the_documented_502_addendum_reaches_the_generated_document(
+    client: TestClient,
+) -> None:
+    """`error_responses(addenda=...)` exists because a caller reads only this.
+
+    FastAPI merges route-level `responses` OVER router-level, so the profile
+    route's own 502 entry REPLACES the router's `IDP_UNAVAILABLE_RESPONSE` —
+    and the IdP meaning of a 502 was documented nowhere a caller looks. It is
+    composed into both routes now, and this is what says so.
+    """
+    paths = client.get("/openapi.json").json()["paths"]
+    profile = paths["/api/v1/profile"]["get"]["responses"]["502"]["description"]
+    session = paths["/api/v1/session"]["get"]["responses"]["502"]["description"]
+
+    assert IDP_UNAVAILABLE_DESCRIPTION in profile
+    assert IDP_UNAVAILABLE_DESCRIPTION in session
+    # And the route-specific half is still there beside it.
+    assert "retryable: false" in profile
+
+
+def test_documenting_a_status_no_code_produces_is_refused() -> None:
+    """The reason `addenda` is a parameter rather than a caller mutating a dict.
+
+    `PROFILE_ERRORS[502]["description"] += ...` at module scope raises KeyError
+    at IMPORT the moment `UPSTREAM_ERROR` is dropped from the call above it — a
+    broken deploy for an edit to a docstring. Here the same mistake is a clear
+    KeyError from the function that knows which statuses exist.
+    """
+    with pytest.raises(KeyError):
+        app_errors.error_responses("INVALID_URL", addenda={502: "no 502 here"})
 
 
 def test_a_narrowed_error_reports_its_own_retryability_not_its_codes(
@@ -1287,7 +1439,7 @@ def test_a_narrowed_error_reports_its_own_retryability_not_its_codes(
     flag rather than on the code.
     """
     response = _raise_over_http(
-        ApiError("UPSTREAM_ERROR", retryable=False, cause="member-mismatch")
+        ApiError("UPSTREAM_ERROR", retryable=False, cause=CAUSE_MEMBER_MISMATCH)
     )
 
     _assert_envelope(response, 502, retryable=False)
@@ -1306,13 +1458,13 @@ def test_the_operator_only_fields_never_reach_the_body(
     response = _raise_over_http(
         ApiError(
             "UPSTREAM_ERROR",
-            cause="malformed-body",
+            cause=CAUSE_MALFORMED_BODY,
             log_detail="identity/dash/profiles: secret-ish internal detail",
         )
     )
 
     assert set(response.json()["error"]) == {"code", "message", "retryable"}
-    assert "malformed-body" not in response.text
+    assert CAUSE_MALFORMED_BODY not in response.text
     assert "secret-ish internal detail" not in response.text
 
 
@@ -1336,32 +1488,102 @@ def test_a_raise_site_cannot_make_a_permanent_failure_retryable() -> None:
     assert ApiError("SESSION_EXPIRED").retryable is False
 
 
-#: Where a per-instance `retryable` override may be written, and nowhere else.
+#: The exact raise sites that may set `retryable` per instance, as
+#: ``(file, enclosing function)``.
 #:
 #: The story's design note: the override is reachable only from named raise
 #: sites, never a general escape hatch. Two guards need it — the client's and
-#: the endpoint's, both refusing to publish a different member — and
-#: `app/errors.py` defines and validates it. A third file appearing here means
-#: the taxonomy is being renegotiated one call site at a time.
+#: the endpoint's, both refusing to publish a different member — plus the
+#: builder that forwards it for the first of those.
+#:
+#: Pinned per SITE rather than per file. A grep for the literal per file cannot
+#: see a third override added to a file already on the list, and
+#: `_upstream_error` is reachable from eleven call sites inside the one file
+#: that legitimately forwards it — so file membership would have waved through
+#: exactly the drift this exists to catch.
 RETRYABLE_OVERRIDE_SITES = {
-    "app/errors.py",
-    "app/linkedin/client.py",
-    "app/api/v1/profile.py",
+    ("app/linkedin/client.py", "_core_profile"),
+    # The builder that forwards the keyword to `ApiError` for the guard above.
+    ("app/linkedin/client.py", "_upstream_error"),
+    ("app/api/v1/profile.py", "get_profile"),
 }
+
+#: Callables whose `retryable=` keyword is a taxonomy override. `ErrorDetail`
+#: and `envelope` also take one, and theirs is the rendering of a decision
+#: already made rather than the making of one.
+OVERRIDE_CALLEES = {"ApiError", "_upstream_error"}
+
+
+def _override_sites() -> set[tuple[str, str]]:
+    """Every `(file, function)` that passes `retryable=` to a raise-site builder."""
+    import ast
+
+    found: set[tuple[str, str]] = set()
+    for path in sorted((REPO_ROOT / "app").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for call in (n for n in ast.walk(node) if isinstance(n, ast.Call)):
+                callee = call.func
+                name = (
+                    callee.attr if isinstance(callee, ast.Attribute)
+                    else callee.id if isinstance(callee, ast.Name)
+                    else ""
+                )
+                if name not in OVERRIDE_CALLEES:
+                    continue
+                if any(keyword.arg == "retryable" for keyword in call.keywords):
+                    found.add((relative, node.name))
+    return found
 
 
 def test_the_retryable_override_is_only_used_where_it_was_argued_for() -> None:
-    overriding = {
-        path.relative_to(REPO_ROOT).as_posix()
-        for path in sorted((REPO_ROOT / "app").rglob("*.py"))
-        if "retryable=" in path.read_text(encoding="utf-8")
-    }
+    sites = _override_sites()
 
-    unexpected = sorted(overriding - RETRYABLE_OVERRIDE_SITES)
-    assert not unexpected, (
-        f"{unexpected} set `retryable` per raise site. The override exists for "
-        "the two member-mismatch guards and is not a general way to disagree "
-        "with response-schema.md — argue the case, then add the file here."
+    assert sites == RETRYABLE_OVERRIDE_SITES, (
+        f"the set of raise sites narrowing `retryable` changed: "
+        f"added={sorted(sites - RETRYABLE_OVERRIDE_SITES)}, "
+        f"removed={sorted(RETRYABLE_OVERRIDE_SITES - sites)}. It exists for the "
+        "two member-mismatch guards and is not a general way to disagree with "
+        "response-schema.md — argue the case, then add the site here."
+    )
+
+
+def test_the_override_pin_would_notice_a_new_site() -> None:
+    """The pin above passes vacuously if the walk finds nothing. It does not."""
+    assert _override_sites(), "the AST walk matched no call site at all"
+    assert ("app/api/v1/profile.py", "get_profile") in _override_sites()
+
+
+def test_an_unregistered_cause_is_refused_at_the_raise_site() -> None:
+    """`cause` is compared for MEMBERSHIP, so a typo means "not that case".
+
+    `DECORATION_RETRY_CAUSES` is a whitelist and `_fetch_core` tests against it.
+    A free-form string would let `"malformed_body"` — one character out — drop a
+    case out of the retry silently, and the symptom (a missing
+    `location.region`, occasionally) points nowhere near the cause. Validated
+    exactly the way `code` is validated against `ERROR_SPECS`.
+    """
+    with pytest.raises(KeyError):
+        ApiError("UPSTREAM_ERROR", cause="malformed_body")
+    with pytest.raises(KeyError):
+        ApiError("UPSTREAM_ERROR", cause="something-new")
+
+    assert ApiError("UPSTREAM_ERROR", cause=CAUSE_MALFORMED_BODY).cause == (
+        CAUSE_MALFORMED_BODY
+    )
+    assert ApiError("UPSTREAM_ERROR").cause is None
+
+
+def test_every_cause_the_app_raises_is_registered() -> None:
+    """The constants and the set they are validated against cannot drift apart."""
+    for name, value in vars(app_errors).items():
+        if name.startswith("CAUSE_"):
+            assert value in app_errors.ERROR_CAUSES, name
+    assert len(app_errors.ERROR_CAUSES) == sum(
+        1 for name in vars(app_errors) if name.startswith("CAUSE_")
     )
 
 
@@ -1455,26 +1677,102 @@ def test_the_catch_all_is_the_last_route_or_it_shadows_the_real_ones() -> None:
     ordering is asserted rather than left to the comment beside it.
     """
     routes = create_app().router.routes
+    guards = [
+        index
+        for index, route in enumerate(routes)
+        if getattr(route, "path", None) in v1.UNMATCHED_PATH_ROUTES
+    ]
 
-    assert getattr(routes[-1], "path", None) == v1.UNMATCHED_PATH_ROUTE
-    assert [
-        route for route in routes if getattr(route, "path", None) == v1.UNMATCHED_PATH_ROUTE
-    ] == [routes[-1]], "exactly one route may declare the catch-all path"
+    assert len(guards) == len(v1.UNMATCHED_PATH_ROUTES), (
+        "each catch-all path must be declared exactly once"
+    )
+    assert guards == list(range(len(routes) - len(guards), len(routes))), (
+        "the catch-all routes must be last, or they shadow real ones"
+    )
 
 
 def test_the_catch_all_is_not_published_as_api_surface(client: TestClient) -> None:
     """It documents nothing callable, and would read as a real endpoint."""
     paths = client.get("/openapi.json").json()["paths"]
 
-    assert v1.UNMATCHED_PATH_ROUTE not in paths
+    assert not set(v1.UNMATCHED_PATH_ROUTES) & set(paths)
     assert not any("unmatched" in path for path in paths)
 
 
-def test_the_catch_all_claims_every_method_a_prober_could_use() -> None:
-    """A method left out is the hole moving rather than closing."""
-    assert set(v1.UNMATCHED_PATH_METHODS) >= {
-        "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS",
-    }
+@pytest.mark.parametrize("method", ["TRACE", "CONNECT", "PROPFIND", "WHATEVER"])
+def test_no_verb_short_circuits_past_the_boundary(
+    client: TestClient, method: str
+) -> None:
+    """A declared method set is a hole, not a courtesy.
+
+    Any verb outside it fell through to Starlette's own 405 — whose `Allow`
+    header then names exactly which methods the real route answers.
+    `TRACE /api/v1/profile` answered `Allow: GET` while `TRACE` on an absent
+    path answered the catch-all's full declared list, which is the distinction
+    this route exists to remove, restored by any verb nobody thought to declare.
+    Invented verbs included, hence `WHATEVER`.
+    """
+    real = client.request(method, PROBE_PATH)
+    absent = client.request(method, UNMATCHED_PATH)
+
+    assert real.status_code == absent.status_code == 401
+    assert real.json() == absent.json()
+    assert "allow" not in {name.lower() for name in real.headers}
+
+
+def test_the_catch_all_matches_on_path_alone(client: TestClient) -> None:
+    """The mechanism behind the row above, so a revert is named where it happens."""
+    assert issubclass(v1.AnyMethodRoute, APIRoute)
+
+    routes = [
+        route
+        for route in create_app().router.routes
+        if getattr(route, "path", None) in v1.UNMATCHED_PATH_ROUTES
+    ]
+
+    assert routes and all(isinstance(route, v1.AnyMethodRoute) for route in routes)
+
+
+def test_a_trailing_slash_on_a_real_route_still_redirects(client: TestClient) -> None:
+    """The regression this route introduced, reinstated.
+
+    `GET /api/v1/profile/` was a `307` to the canonical path before story 8 and
+    became a hard `404`, because the catch-all full-matches and Starlette's
+    `redirect_slashes` never runs. A client-visible break for a request that
+    used to work is not an acceptable side effect of an error-shape change.
+    """
+    response = client.get(
+        PROBE_PATH + "/", headers=bearer(make_token()), follow_redirects=False
+    )
+
+    assert response.status_code == 307, response.text
+    assert response.headers["location"].endswith(PROBE_PATH)
+
+
+def test_a_trailing_slash_on_an_absent_route_is_still_a_404(
+    client: TestClient,
+) -> None:
+    """The redirect must not invent a destination that does not exist either."""
+    _assert_envelope(
+        client.get(
+            UNMATCHED_PATH + "/", headers=bearer(make_token()), follow_redirects=False
+        ),
+        404,
+        retryable=False,
+    )
+
+
+def test_the_versioned_prefix_itself_is_not_a_redirect(client: TestClient) -> None:
+    """`/api/v1` has no separating slash, so a `{path:path}` route misses it.
+
+    It fell through to `redirect_slashes` and answered `307` without a token —
+    the one status the uniformity is supposed to remove, reachable by dropping
+    a character.
+    """
+    response = client.get("/api/v1", follow_redirects=False)
+
+    assert response.status_code == 401, response.text
+    assert_unauthenticated(response)
 
 
 def test_the_error_handler_refuses_a_type_it_cannot_render() -> None:

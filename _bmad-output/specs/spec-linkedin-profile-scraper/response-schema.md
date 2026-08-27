@@ -115,6 +115,8 @@ GET  /api/v1/session                                presence and validity only, 
 
 `retryable` exists so a client can decide without parsing prose. `428` is chosen over `403` for the session cases because the condition is precisely "a precondition is missing and you can fix it", which is what the caller needs to know.
 
+**The `Retryable` column above is the default for each code, not a guarantee about every response carrying it: `retryable` is a property of the response and the value on the wire is authoritative.** A client branches on the field, never on the code — one condition (an upstream answer naming a different member than the request asked for) returns `UPSTREAM_ERROR` with `retryable: false`, because it is permanent and repeating the request cannot change it.
+
 Stale-serve takes precedence over the retryable errors: when a cached record exists, `RATE_LIMITED`, `UPSTREAM_CHALLENGE`, and `UPSTREAM_ERROR` become a 200 with `"stale": true`. The error is only returned when there is nothing cached to fall back to.
 
 Stale-serve is **unbounded**. Cached records have no TTL and are never evicted, so a record of any age is served in preference to a retryable error. `fetched_at` is the caller's only staleness signal, which makes it load-bearing rather than informational.

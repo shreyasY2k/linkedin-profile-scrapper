@@ -51,7 +51,7 @@ from app import auth
 from app.api.v1 import profile as profile_routes
 from app.api.v1 import session as session_routes
 from app.cache import ProfileCache
-from app.errors import ApiError
+from app.errors import CAUSE_MALFORMED_BODY, CAUSE_MEMBER_MISMATCH, ApiError
 from app.linkedin.client import RawProfile
 from app.main import create_app
 from app.mapping.profile import CONTRACT_FIELDS, EMPLOYMENT_TYPE_PATH
@@ -1122,7 +1122,7 @@ def test_the_mismatch_is_refused_by_the_taxonomy_and_not_only_by_its_placement(
     fetch.raises = ApiError(
         "UPSTREAM_ERROR",
         retryable=False,
-        cause="member-mismatch",
+        cause=CAUSE_MEMBER_MISMATCH,
         log_detail="core response named a different member",
     )
 
@@ -1139,13 +1139,13 @@ def test_the_cause_is_operator_only_and_never_reaches_the_caller(
     """`cause` names an internal classification branch. It joins `log_detail`."""
     store_session(vault, SUBJECT_A)
     fetch.raises = ApiError(
-        "UPSTREAM_ERROR", cause="malformed-body", log_detail="internal reason"
+        "UPSTREAM_ERROR", cause=CAUSE_MALFORMED_BODY, log_detail="internal reason"
     )
 
     response = get(client)
 
     assert set(response.json()["error"]) == {"code", "message", "retryable"}
-    assert "malformed-body" not in response.text
+    assert CAUSE_MALFORMED_BODY not in response.text
     assert "internal reason" not in response.text
 
 

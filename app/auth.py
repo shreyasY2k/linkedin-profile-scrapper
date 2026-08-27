@@ -48,7 +48,7 @@ from fastapi.security import OAuth2
 from fastapi.security.utils import get_authorization_scheme_param
 
 from app.config import settings
-from app.errors import ApiError, unauthenticated
+from app.errors import CAUSE_IDP_UNREACHABLE, ApiError, unauthenticated
 
 logger = logging.getLogger(__name__)
 
@@ -191,11 +191,14 @@ class JwksUnavailable(Exception):
     Routed to ``UPSTREAM_ERROR`` / 502 / ``retryable: true`` — the honest answer,
     and the one a client can act on by trying again in a moment.
 
-    It covers every way the key set can fail to arrive, not only a refused
-    connection: a fetch that raised, a document that is not an object, a
-    document carrying no usable signature key, and — through
-    :meth:`JwksCache.signing_key` — a cache that holds nothing because an
-    earlier attempt failed and the refresh floor is suppressing another.
+    It covers every way this process can end up holding **no** key set: a fetch
+    that raised, a document that is not an object, a document carrying no usable
+    signature key, and a cache still empty because an earlier attempt failed and
+    the refresh floor is suppressing another.
+
+    Note what it does NOT cover. Once any usable key set is held, an unknown
+    ``kid`` is :class:`SigningKeyUnavailable` and a 401 — even if the refresh
+    that ran alongside it failed. Keys we hold are keys we can check against.
     """
 
 
@@ -271,13 +274,23 @@ class JwksCache:
 
         Two different failures, deliberately two different exceptions — see
         :class:`JwksUnavailable`. The discriminator is *whether this process
-        holds a key set it could have checked ``kid`` against*:
+        holds a key set it could have checked ``kid`` against*, and it is that
+        one question on **both** exits:
 
-        * It does, and ``kid`` is not in it → :class:`SigningKeyUnavailable`.
-          The realm was reachable and does not publish this key. 401.
-        * It does not, or the refresh this call performed did not produce one →
-          :class:`JwksUnavailable`. Nothing has been decided about the token.
-          502, retryable.
+        * Keys are held and ``kid`` is not among them →
+          :class:`SigningKeyUnavailable`. The realm published a set, this token
+          is not in it. 401.
+        * No keys are held at all → :class:`JwksUnavailable`. Nothing has been
+          decided about the token. 502, retryable.
+
+        Whether *this call* refreshed, and whether that refresh succeeded, is
+        deliberately not part of the answer. Making it part of the answer is a
+        bug that was caught in review: with keys held and a refetch that came
+        back unusable, an unknown ``kid`` returned 502 — and then 401 for the
+        same token thirty seconds later, once the refresh floor stopped it
+        refetching. A token's verdict must not depend on which side of a
+        refresh window it arrived on, and ``response-schema.md``'s matrix says
+        an unknown signing key is a 401 and must not regress into a 502.
         """
         with self._lock:
             key = self._keys.get(kid)
@@ -302,19 +315,16 @@ class JwksCache:
         document = self._fetch_document()
 
         with self._lock:
-            installed = (
+            if document is not None:
                 self._install(document, time.monotonic())
-                if document is not None
-                else False
-            )
             key = self._keys.get(kid)
             held = bool(self._keys)
 
         if key is not None:
             return key
-        if installed and held:
-            # A key set arrived and this kid is not in it. The only branch that
-            # is genuinely a statement about the token.
+        # The same two lines as the no-fetch branch above, and that is the
+        # point: one discriminator, one answer, whatever route got here.
+        if held:
             raise SigningKeyUnavailable(kid)
         raise JwksUnavailable(self._url)
 
@@ -367,13 +377,14 @@ class JwksCache:
             return None
         return document
 
-    def _install(self, document: dict[str, Any], now: float) -> bool:
+    def _install(self, document: dict[str, Any], now: float) -> None:
         """Adopt a fetched key set. Under the lock.
 
-        Returns whether a usable set was actually adopted, which is half of the
-        401-versus-502 decision in :meth:`signing_key`: a document that empties
-        under this filter tells us nothing about any ``kid``, so a token cannot
-        be refused on the strength of it.
+        Reports nothing back on purpose. An earlier revision returned whether a
+        usable set was adopted and :meth:`signing_key` branched on it, which is
+        how an unknown ``kid`` came to depend on the timing of a refresh — the
+        only thing that decides 401 versus 502 is whether keys are held once
+        this has run, and that is readable from ``self._keys``.
         """
         keys = _signature_keys(document)
         if not keys:
@@ -382,12 +393,11 @@ class JwksCache:
             # empties, and replacing the cache with {} would 401 every caller
             # until the next refresh window.
             logger.error("JWKS at %s contained no usable signature key", self._url)
-            return False
+            return
 
         self._keys = keys
         self._loaded_at = now
         logger.info("Loaded %d signature key(s) from %s", len(keys), self._url)
-        return True
 
 
 def _signature_keys(document: dict[str, Any]) -> dict[str, jwt.PyJWK]:
@@ -576,6 +586,11 @@ def require_claims(
         raise ApiError(
             "UPSTREAM_ERROR",
             message="The identity provider could not be reached to validate the token.",
+            # The whole reason `cause` exists: `UPSTREAM_ERROR` now means both
+            # "LinkedIn could not be read" and "Keycloak could not be read", and
+            # an operator reading a 502 in the log needs to know which service
+            # to go and look at.
+            cause=CAUSE_IDP_UNREACHABLE,
             log_detail=f"JWKS unavailable: {_loggable(exc)}",
         ) from None
 

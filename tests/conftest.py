@@ -9,6 +9,10 @@ inside the test that is supposed to observe the failure.
 from __future__ import annotations
 
 import os
+import socket
+from typing import Any
+
+import pytest
 
 from cryptography.fernet import Fernet
 
@@ -106,3 +110,47 @@ def pytest_configure(config: object) -> None:
         "markers",
         "postgres: hits a real Postgres. Skipped unless POSTGRES_LIVE_CHECK=1.",
     )
+
+
+# --- No test reaches a real network -------------------------------------------
+#
+# The suite has to pass under `docker run --network none`, and asserting that in
+# CI is not the same as noticing when it stops being true: a test that silently
+# starts talking to the internet passes everywhere the internet is reachable.
+#
+# It happened. `VoyagerClient`'s transport default was bound at `def` time, so a
+# test that replaced `app.linkedin.client.urllib_transport` on the module was
+# never calling its substitute — and had been fetching the real linkedin.com,
+# from the offline suite, for two stories. Nothing failed; the live response
+# simply classified as the code the assertion expected.
+#
+# So the guard is structural rather than a convention. Any attempt to open a
+# socket fails the test that made it, naming what it tried to reach. The two
+# opt-in live checks are exempted by their markers, because reaching a real
+# service is the entire point of those.
+
+#: Markers whose tests are *supposed* to use the network.
+LIVE_MARKERS = frozenset({"live", "postgres"})
+
+
+class NetworkUseInTests(RuntimeError):
+    """A test tried to open a real connection."""
+
+
+@pytest.fixture(autouse=True)
+def _no_real_network(request: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail any test that opens a socket, unless it is a marked live check."""
+    if LIVE_MARKERS & set(request.node.keywords):
+        return
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        target = args[1] if len(args) > 1 else kwargs.get("address", args[:1])
+        raise NetworkUseInTests(
+            f"this test tried to open a real connection to {target!r}. The suite "
+            "runs under `--network none` and must not depend on anything "
+            "outside the process: inject the transport, or mark the test `live`."
+        )
+
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+    monkeypatch.setattr(socket.socket, "connect_ex", refuse)
+    monkeypatch.setattr(socket, "create_connection", refuse)

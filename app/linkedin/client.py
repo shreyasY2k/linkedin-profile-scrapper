@@ -96,7 +96,16 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
-from app.errors import ApiError
+from app.errors import (
+    CAUSE_BAD_REQUEST,
+    CAUSE_CLIENT_BUG,
+    CAUSE_GONE,
+    CAUSE_MALFORMED_BODY,
+    CAUSE_MEMBER_MISMATCH,
+    CAUSE_TRANSPORT,
+    CAUSE_UNEXPECTED_STATUS,
+    ApiError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -201,37 +210,24 @@ SYSTEMIC_CODES = frozenset({"SESSION_EXPIRED", "RATE_LIMITED", "UPSTREAM_CHALLEN
 # for every one, so a LinkedIn outage cost a second doomed call against an
 # account that was already failing.
 #
-# `ApiError.cause` carries the discriminator, operator-side only. It is never in
-# a response body and never reaches a caller; it exists so the one narrow retry
-# in this file can be narrow for the right reason.
-
-#: LinkedIn refused the request as malformed. What a withdrawn or revised
-#: ``decorationId`` looks like.
-CAUSE_BAD_REQUEST = "bad-request"
-#: The endpoint is gone. Also what a withdrawn decoration looks like.
-CAUSE_GONE = "gone"
-#: A 200 whose body is not the collection envelope this client can read — an
-#: unparseable body, a non-object payload, a missing ``*elements``. A decoration
-#: LinkedIn half-honours lands here too.
-CAUSE_MALFORMED_BODY = "malformed-body"
-#: Any other status. A 500 or a 503 is a fact about LinkedIn, not about the
-#: request that was sent.
-CAUSE_UNEXPECTED_STATUS = "unexpected-status"
-#: The call never completed: DNS, TLS, connection reset, timeout.
-CAUSE_TRANSPORT = "transport"
-#: The response was readable and describes a different member than the one
-#: asked for. The one cause that is also **not retryable** — see
-#: :meth:`VoyagerClient._core_profile`.
-CAUSE_MEMBER_MISMATCH = "member-mismatch"
+# The vocabulary itself lives in `app/errors.py` beside `ERROR_SPECS`, and is
+# validated there: a cause is compared for MEMBERSHIP below, so an unregistered
+# one would silently mean "not that case" rather than failing. Imported here
+# because these are the values this module raises with.
 
 #: The causes that look like a refused decoration, and therefore the *only*
 #: ones that earn the seventh call.
 #:
 #: Deliberately a whitelist. `_fetch_core` used to retry on the code alone,
-#: which meant every cause above bought a second call; the boundary this story
-#: works under says the retry may be narrowed but never widened, and a whitelist
-#: is what makes adding a cause an explicit act rather than a side effect of
+#: which meant every cause bought a second call; the boundary this story works
+#: under says the retry may be narrowed but never widened, and a whitelist is
+#: what makes adding a cause an explicit act rather than a side effect of
 #: classifying something new as ``UPSTREAM_ERROR``.
+#:
+#: `CAUSE_CLIENT_BUG` is the one worth naming as absent. It means a function in
+#: THIS file raised, which is not evidence that LinkedIn sent anything at all —
+#: so retrying it would spend a live call against the account to run the same
+#: bug a second time.
 DECORATION_RETRY_CAUSES = frozenset(
     {CAUSE_BAD_REQUEST, CAUSE_GONE, CAUSE_MALFORMED_BODY}
 )
@@ -1172,6 +1168,7 @@ class VoyagerClient:
                 systemic = systemic or self._upstream_error(
                     SECTION_RESOURCES[name],
                     f"section task raised {type(result).__name__}: {self._safe(result)}",
+                    cause=CAUSE_CLIENT_BUG,
                 )
 
         if systemic is not None:
@@ -1299,7 +1296,12 @@ class VoyagerClient:
             raise self._upstream_error(
                 resource,
                 f"classifying the response raised {type(exc).__name__}: {self._safe(exc)}",
-                cause=CAUSE_MALFORMED_BODY,
+                # NOT `malformed-body`, which is in the retry whitelist. What
+                # happened here is that `_classify` itself threw — a bug in this
+                # file, or a body crafted to make it throw — and neither is a
+                # refused decoration. Tagging it as a bad body bought the second
+                # doomed call the whitelist exists to prevent.
+                cause=CAUSE_CLIENT_BUG,
             )
 
     def _classify(self, response: VoyagerResponse, *, resource: str) -> dict[str, Any]:

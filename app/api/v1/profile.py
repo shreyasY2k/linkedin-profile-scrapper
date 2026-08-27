@@ -90,9 +90,17 @@ from pydantic import BaseModel, Field
 from app.auth import require_claims
 from app.cache import DATASTORE_UNAVAILABLE, UNUSABLE_RECORD, Fallback, ProfileCache
 from app.cache import cache as _process_cache
-from app.errors import NO_STORE, ApiError, ErrorEnvelope, error_responses
-from app.linkedin.client import (
+from app.errors import (
+    CAUSE_CLIENT_BUG,
+    CAUSE_DEADLINE,
     CAUSE_MEMBER_MISMATCH,
+    IDP_UNAVAILABLE_DESCRIPTION,
+    NO_STORE,
+    ApiError,
+    ErrorEnvelope,
+    error_responses,
+)
+from app.linkedin.client import (
     DEFAULT_TIMEOUT_SECONDS,
     RawProfile,
     VoyagerClient,
@@ -345,6 +353,16 @@ class ProfileEnvelope(BaseModel):
 
 #: Every taxonomy code this route can answer, straight from `ERROR_SPECS` so the
 #: documented status and the returned status cannot disagree.
+#:
+#: The 502 needs two things `ERROR_SPECS` cannot say by itself, and both are
+#: passed as addenda rather than patched into the result afterwards — FastAPI
+#: merges route-level `responses` OVER router-level, so this entry *replaces*
+#: `IDP_UNAVAILABLE_RESPONSE` from the router and has to carry its meaning too:
+#:
+#: * `retryable` is a per-response property here, and the wire value is
+#:   authoritative over the contract's table for the member-mismatch case;
+#: * a 502 on this route is not always about LinkedIn — the authentication
+#:   boundary answers one when the identity provider cannot be reached.
 PROFILE_ERRORS: dict[int | str, dict[str, Any]] = {
     **error_responses(
         "INVALID_URL",
@@ -354,6 +372,17 @@ PROFILE_ERRORS: dict[int | str, dict[str, Any]] = {
         "RATE_LIMITED",
         "UPSTREAM_CHALLENGE",
         "UPSTREAM_ERROR",
+        addenda={
+            502: (
+                "**Read `retryable` from the body, not from the table.** A "
+                "response that names a different member than the URL asked for "
+                "is `UPSTREAM_ERROR` with `retryable: false`: it is a permanent "
+                "condition — a vanity URL that now belongs to someone else — "
+                "and it is never softened into a stale 200, whatever is cached. "
+                "Every other `UPSTREAM_ERROR` here is retryable. "
+                + IDP_UNAVAILABLE_DESCRIPTION
+            )
+        },
     ),
     # Not taxonomy rows — see `app/errors.py`. Documented because a status a
     # route can answer and does not document is one a client meets by surprise.
@@ -366,19 +395,6 @@ PROFILE_ERRORS: dict[int | str, dict[str, Any]] = {
         "description": "`SERVICE_UNAVAILABLE` — the session store could not be reached.",
     },
 }
-
-# The 502's meaning changed with story 8 and the generated description cannot
-# say so on its own: `error_responses` builds it from `ERROR_SPECS`, which
-# carries one message and one `retryable` per code, and this status now covers a
-# case that contradicts the published table. Appended rather than replaced, so
-# the codes and their own messages still come from the taxonomy.
-PROFILE_ERRORS[502]["description"] += (
-    " **Read `retryable` from the body, not from the table.** A response that "
-    "names a different member than the URL asked for is `UPSTREAM_ERROR` with "
-    "`retryable: false`: it is a permanent condition — a vanity URL that now "
-    "belongs to someone else — and it is never softened into a stale 200, "
-    "whatever is cached. Every other `UPSTREAM_ERROR` here is retryable."
-)
 
 
 def _isoformat(moment: datetime) -> str:
@@ -570,6 +586,7 @@ async def get_profile(
             await _record_outcome(vault, subject, state, ok=None)
             raise ApiError(
                 "UPSTREAM_ERROR",
+                cause=CAUSE_DEADLINE,
                 log_detail=f"fetch exceeded {PROFILE_FETCH_DEADLINE_SECONDS}s",
             ) from exc
         except ApiError as exc:
@@ -607,6 +624,10 @@ async def get_profile(
             await _record_outcome(vault, subject, state, ok=None)
             raise ApiError(
                 "UPSTREAM_ERROR",
+                # This codebase raised, not LinkedIn — the same distinction the
+                # client draws, drawn here for the same reason: an operator
+                # reading a 502 needs to know whose fault it was.
+                cause=CAUSE_CLIENT_BUG,
                 log_detail=f"the fetch raised {type(exc).__name__}",
             ) from exc
     except ApiError as exc:
