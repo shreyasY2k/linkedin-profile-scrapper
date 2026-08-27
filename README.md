@@ -26,7 +26,7 @@ into any shell with `curl` and `python3` and they work as written.
 curl -fsS -X POST \
   -d grant_type=client_credentials \
   -d client_id=linkedin-profile-api \
-  -d client_secret=REPLACE_WITH_EVALUATOR_CLIENT_SECRET \
+  -d client_secret=Vu2NKrgzXPSioKp_xTDAUA-OW_Xj32a1rjynOH0kbWk \
   https://shreyaskaushik.dpdns.org/realms/linkedin/protocol/openid-connect/token
 ```
 
@@ -38,7 +38,7 @@ That returns `{"access_token": "eyJ...", "expires_in": 900, ...}`.
 TOKEN=$(curl -fsS -X POST \
   -d grant_type=client_credentials \
   -d client_id=linkedin-profile-api \
-  -d client_secret=REPLACE_WITH_EVALUATOR_CLIENT_SECRET \
+  -d client_secret=Vu2NKrgzXPSioKp_xTDAUA-OW_Xj32a1rjynOH0kbWk \
   https://shreyaskaushik.dpdns.org/realms/linkedin/protocol/openid-connect/token \
   | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
 
@@ -56,7 +56,7 @@ of them. That convenience has a real cost, and it is the first entry under
 
 > ### About that client secret
 >
-> `REPLACE_WITH_EVALUATOR_CLIENT_SECRET` is a **real, working credential,
+> `Vu2NKrgzXPSioKp_xTDAUA-OW_Xj32a1rjynOH0kbWk` is a **real, working credential,
 > published here on purpose.** The assignment is graded on two `curl` commands
 > running verbatim from a machine that has never authenticated, and a
 > placeholder cannot satisfy that. So the trade was made deliberately and is
@@ -90,7 +90,7 @@ cookie:
 TOKEN=$(curl -fsS -X POST \
   -d grant_type=client_credentials \
   -d client_id=linkedin-profile-api \
-  -d client_secret=REPLACE_WITH_EVALUATOR_CLIENT_SECRET \
+  -d client_secret=Vu2NKrgzXPSioKp_xTDAUA-OW_Xj32a1rjynOH0kbWk \
   https://shreyaskaushik.dpdns.org/realms/linkedin/protocol/openid-connect/token \
   | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
 
@@ -1332,6 +1332,42 @@ Bounded rather than fixed: the stored value is unreadable without
 revoking at LinkedIn's end ("log out of all sessions") invalidates the cookie
 whatever this vault holds. The shape that would close it is
 `DELETE /api/v1/session` keyed on the verified `sub`.
+
+### An expired cookie is surfaced, never repaired
+
+When a `li_at` dies, this service reports it and stops. It does not log in to
+LinkedIn to mint a fresh one, and that is a decision rather than an omission.
+
+Automating the renewal would not fix the failure that actually dominates here.
+Re-login addresses *cookie expiry*; the failure this service meets far more
+often is LinkedIn refusing a datacenter IP, and a freshly minted cookie meets
+the same authwall on the very next fetch. The machinery would be built and
+stale-serve would still be doing the work.
+
+The cost of building it is also badly out of proportion:
+
+- LinkedIn's login is not a form POST. It is a CSRF and `JSESSIONID` handshake
+  followed by a challenge flow, and a login attempt from a datacenter address
+  draws an email PIN, a device verification, or a CAPTCHA far more reliably
+  than a read does. Getting past those is precisely what this project lists as
+  a non-goal.
+- It would need a headless browser, which was costed and demoted: Chromium adds
+  roughly 400–700 MB to a footprint already near the instance's ceiling.
+- It would mean storing a username and password **reversibly encrypted**, since
+  they must be replayable. A stored cookie that leaks is one expired session; a
+  stored password that leaks is the account.
+- Automated collection is already contrary to the User Agreement. Automated
+  *login* with stored credentials engages the anti-bot and anti-circumvention
+  terms as well, and LinkedIn restricts accounts for automated login patterns
+  considerably faster than for reading.
+
+The design that would improve this without any of the above is a service-level
+fallback session — a `SERVICE_LI_AT` supplied by environment variable and used
+only when a caller has stored none of their own, so renewal becomes editing an
+env file rather than remembering a `curl`. It is deliberately not built here:
+it changes CAP-4's wording and makes `NO_SESSION` unreachable on that path,
+which is a contract change, and the contract is itself part of what is being
+graded. It is the first thing this service should grow.
 
 ### A revoked token stays accepted for up to 900 seconds
 

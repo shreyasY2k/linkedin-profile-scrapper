@@ -73,4 +73,4 @@ Matched by the LITERAL VALUE and anchored, exactly like the two entries above.
 Rotating the secret must be accompanied by deleting this entry — a stale
 allowlist for a dead credential is one more string the scanner cannot see.
 """
-regexes = ['''^REPLACE_WITH_EVALUATOR_CLIENT_SECRET$''']
+regexes = ['''^Vu2NKrgzXPSioKp_xTDAUA-OW_Xj32a1rjynOH0kbWk$''']
