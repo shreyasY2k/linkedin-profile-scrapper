@@ -139,6 +139,15 @@ answered with 401 and the typed error body:
 
 One message for every rejection reason, deliberately: the specific reason is in
 the API container's logs, where an operator can read it and a prober cannot.
+Any path under `/api/v1` answers this, whether or not the path exists — a `404`
+for an unknown route and a `401` for a real one would let anyone map this API's
+surface without presenting a token.
+
+**A 401 is always about your token.** If *this service* cannot reach Keycloak to
+read the realm's signing keys, you get a `502 UPSTREAM_ERROR` with
+`"retryable": true` instead, because your token was never checked and telling
+you to stop trying would be a claim about a credential nobody looked at. Tokens
+already validated against a cached key set keep working through the outage.
 
 ```bash
 docker compose logs api | grep "Rejected request"
@@ -358,9 +367,15 @@ Errors wear the same typed envelope as everything else:
 | `503 SERVICE_UNAVAILABLE` | this service could not reach its own datastore |
 | `500 INTERNAL_ERROR` | a bug here. It still wears the envelope above; nothing ever returns a naked 500 or a stack trace |
 
-The three with `"retryable": true` — `RATE_LIMITED`, `UPSTREAM_CHALLENGE`,
-`UPSTREAM_ERROR` — are the ones you may never actually see, because a cached
-record outranks them. The reverse also holds and matters more: a `428
+**Branch on `retryable`, not on the code.** It is a property of the *response*,
+not of the code: there is one condition — LinkedIn answering about a different
+member — that returns `502 UPSTREAM_ERROR` with `"retryable": false`, because
+that condition is permanent and repeating the request cannot change it. The
+field exists precisely so you never have to parse prose to find that out.
+
+The three whose default is `"retryable": true` — `RATE_LIMITED`,
+`UPSTREAM_CHALLENGE`, `UPSTREAM_ERROR` — are the ones you may never actually
+see, because a cached record outranks them. The reverse also holds and matters more: a `428
 SESSION_EXPIRED` is never softened into a stale `200`, with one honest
 exception. See **When LinkedIn will not answer** below for both.
 
@@ -455,10 +470,12 @@ with a record in the cache:
 The last row is a deliberate choice rather than a consequence. If a fetch comes
 back naming somebody other than the member you asked for — a vanity URL that has
 changed hands, a redirect, an upstream substitution — you get a `502` and *not*
-the cached record, even though the code it carries is technically retryable.
-That condition is permanent, and under a cache with no expiry a stale `200`
-would republish the old identity mapping for ever without ever telling you the
-URL has stopped meaning what you think.
+the cached record. The body says so: that response carries `"retryable": false`
+even though `UPSTREAM_ERROR` is retryable everywhere else, and the flag on the
+wire is authoritative over the table above. The condition is permanent, and
+under a cache with no expiry a stale `200` would republish the old identity
+mapping for ever without ever telling you the URL has stopped meaning what you
+think.
 
 Hiding a dead cookie behind cached data would report success forever about a
 credential that stopped working, which is the one failure this design exists to
@@ -468,12 +485,17 @@ avoid.
 > *state* a refusal as a refusal. A dead `li_at` is sometimes answered with a
 > redirect to an authwall carrying a `200`, which is the same page a datacenter
 > IP draws with a perfectly good session — this service genuinely cannot tell
-> them apart, so it classifies both as `UPSTREAM_CHALLENGE`, which is retryable,
-> which means that particular kind of dead session **is** stale-served. This was
-> verified against the running stack, not theorised. If `stale` has been `true`
-> for longer than you can explain, re-`PUT` your session before assuming
-> LinkedIn is the problem; `GET /api/v1/session` will show `last_use_ok: null`
-> ("could not tell"), never a false `true`.
+> them apart, so **on a profile fetch** it classifies both as
+> `UPSTREAM_CHALLENGE`, which is retryable, which means that particular kind of
+> dead session **is** stale-served. This was verified against the running stack,
+> not theorised.
+>
+> The gap is narrower than it was. `PUT /api/v1/session` verifies your cookie
+> against the `me` endpoint, which describes the session's *own owner* — the
+> same wall in reply to *that* question is about the cookie and nothing else, so
+> it is read as expiry and the `PUT` answers `last_use_ok: false` immediately.
+> So: if `stale` has been `true` for longer than you can explain, re-`PUT` your
+> session. Neither endpoint will ever report a false `true`.
 
 **The cache is shared between callers, and that is a trade.** It is keyed by
 public id, not by caller, so a record fetched under one caller's session answers
@@ -733,13 +755,27 @@ _To be written by story 9._
      1. A dead li_at whose authwall arrives as a 200 classifies as
         UPSTREAM_CHALLENGE (retryable) and IS stale-served indefinitely, so the
         "SESSION_EXPIRED is never a stale 200" guarantee has a real gap.
-        Verified live, not theorised.
+        Verified live, not theorised. Story 8 narrowed it as far as the evidence
+        allows: the same wall on the `me` endpoint, which describes the
+        session's own owner, IS read as expiry, so PUT /api/v1/session tells the
+        caller their cookie is dead at the moment they store it. On a profile
+        fetch the two pages remain indistinguishable and the gap stands.
      2. The response cache is keyed by profile and shared across callers, while
         LinkedIn's retrieval is viewer-relative — so a stale answer can be a
         richer view than the requesting caller's own session would produce.
         Accepted for a single-evaluator service; not acceptable multi-tenant.
      3. Media URLs in a stale record are signed and expire, so an old record's
-        images 403. Deliberately not stripped — see the README section. -->
+        images 403. Deliberately not stripped — see the README section.
+
+     Story 8 adds one that MUST be stated here, because it is a deliberate,
+     human-approved deviation from a published contract rather than a caveat:
+
+     4. `retryable` is a property of the RESPONSE, not of the code.
+        response-schema.md's table marks UPSTREAM_ERROR retryable; a response
+        naming a different member than the URL asked for returns that code with
+        `retryable: false`. The wire value is authoritative over the table for
+        this one case, and a client must branch on the flag rather than on the
+        code. A new taxonomy row was the declined alternative. -->
 
 _To be written by story 9._
 

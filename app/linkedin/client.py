@@ -191,6 +191,51 @@ PROFILE_TYPE_SUFFIX = "identity.profile.Profile"
 #: be specific to one sub-resource, and those still degrade.
 SYSTEMIC_CODES = frozenset({"SESSION_EXPIRED", "RATE_LIMITED", "UPSTREAM_CHALLENGE"})
 
+# --- What an UPSTREAM_ERROR actually was ---------------------------------------
+#
+# `_classify` collapses a 400, a 410, an unexpected status and an unparseable
+# body into one `UPSTREAM_ERROR`, and it is right to: the caller can do nothing
+# different with any of them, and `response-schema.md` has one row for "any
+# other upstream failure". But *this module* can do something different with
+# them, and used to be unable to — `_fetch_core` retried the core undecorated
+# for every one, so a LinkedIn outage cost a second doomed call against an
+# account that was already failing.
+#
+# `ApiError.cause` carries the discriminator, operator-side only. It is never in
+# a response body and never reaches a caller; it exists so the one narrow retry
+# in this file can be narrow for the right reason.
+
+#: LinkedIn refused the request as malformed. What a withdrawn or revised
+#: ``decorationId`` looks like.
+CAUSE_BAD_REQUEST = "bad-request"
+#: The endpoint is gone. Also what a withdrawn decoration looks like.
+CAUSE_GONE = "gone"
+#: A 200 whose body is not the collection envelope this client can read — an
+#: unparseable body, a non-object payload, a missing ``*elements``. A decoration
+#: LinkedIn half-honours lands here too.
+CAUSE_MALFORMED_BODY = "malformed-body"
+#: Any other status. A 500 or a 503 is a fact about LinkedIn, not about the
+#: request that was sent.
+CAUSE_UNEXPECTED_STATUS = "unexpected-status"
+#: The call never completed: DNS, TLS, connection reset, timeout.
+CAUSE_TRANSPORT = "transport"
+#: The response was readable and describes a different member than the one
+#: asked for. The one cause that is also **not retryable** — see
+#: :meth:`VoyagerClient._core_profile`.
+CAUSE_MEMBER_MISMATCH = "member-mismatch"
+
+#: The causes that look like a refused decoration, and therefore the *only*
+#: ones that earn the seventh call.
+#:
+#: Deliberately a whitelist. `_fetch_core` used to retry on the code alone,
+#: which meant every cause above bought a second call; the boundary this story
+#: works under says the retry may be narrowed but never widened, and a whitelist
+#: is what makes adding a cause an explicit act rather than a side effect of
+#: classifying something new as ``UPSTREAM_ERROR``.
+DECORATION_RETRY_CAUSES = frozenset(
+    {CAUSE_BAD_REQUEST, CAUSE_GONE, CAUSE_MALFORMED_BODY}
+)
+
 #: Path fragments that mean LinkedIn answered with a wall instead of data. A
 #: challenge usually arrives as a *redirect* that urllib follows, so the final
 #: URL is the reliable signal — the status on the page it lands on is 200.
@@ -834,19 +879,29 @@ class VoyagerClient:
     ``transport`` is injectable so that the whole edge-case matrix is testable
     offline. The default is the stdlib one; the test suite never installs a
     transport that can reach a network.
+
+    ``None`` means "the module's transport", resolved **here rather than in the
+    signature**. A default argument is bound once, when this ``def`` executes,
+    so ``transport=urllib_transport`` captured the function object at import and
+    a test replacing :data:`urllib_transport` on the module changed nothing —
+    silently, since the substitute was simply never called. One test did exactly
+    that and had been reaching the real linkedin.com from inside the offline
+    suite ever since. Resolving at construction makes the module attribute the
+    single answer to "what does this client call", which is what every reader
+    already assumed.
     """
 
     def __init__(
         self,
         cookie: str,
         *,
-        transport: Transport = urllib_transport,
+        transport: Transport | None = None,
         jsessionid: str = DEFAULT_JSESSIONID,
         user_agent: str = DEFAULT_USER_AGENT,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         self._session = LinkedInSession(cookie)
-        self._transport = transport
+        self._transport = urllib_transport if transport is None else transport
         # Same header-safety rules as the cookie, different failure type, and
         # the difference is deliberate. The cookie is caller data, so a bad one
         # is a 428 the caller can act on. The CSRF token is a code-level
@@ -927,7 +982,9 @@ class VoyagerClient:
         profile_urn = profile.get("entityUrn")
         if not isinstance(profile_urn, str) or not profile_urn:
             raise self._upstream_error(
-                CORE_RESOURCE, "Profile entity carried no entityUrn"
+                CORE_RESOURCE,
+                "Profile entity carried no entityUrn",
+                cause=CAUSE_MALFORMED_BODY,
             )
 
         sections = await self._fetch_sections(profile_urn)
@@ -976,6 +1033,17 @@ class VoyagerClient:
         URL could in principle answer under an old id, and this would refuse
         it. Refusing to answer is recoverable; answering with the wrong human
         being is not.
+
+        **And the refusal is not retryable.** ``UPSTREAM_ERROR`` is retryable in
+        ``response-schema.md``, and until story 8 this guard inherited that —
+        which meant the refusal was raised *inside* the stale-serve boundary and
+        answered with a cached 200 whenever a record existed. So the one guard
+        against publishing the wrong human being was, in exactly the case where
+        it mattered, disabled by the code it raised. A response naming a
+        different member is permanent: a vanity URL that now belongs to somebody
+        else does not stop belonging to them because the caller asked twice.
+        The endpoint's own guard in ``app/api/v1/profile.py`` narrows the same
+        way, and the two are independent on purpose.
         """
         elements = resolve_elements(core)
         profile = next(
@@ -1000,7 +1068,10 @@ class VoyagerClient:
                 _loggable_public_id(identifier),
             )
             raise self._upstream_error(
-                CORE_RESOURCE, "core response named a different member"
+                CORE_RESOURCE,
+                "core response named a different member",
+                cause=CAUSE_MEMBER_MISMATCH,
+                retryable=False,
             )
         return profile
 
@@ -1013,9 +1084,10 @@ class VoyagerClient:
 
         The decoration id is version-pinned and LinkedIn revises these without
         notice, so a refusal falls back to the plain request and the profile
-        comes back without a region. The fallback is deliberately narrow — only
-        ``UPSTREAM_ERROR``, which is what a rejected or withdrawn decoration
-        looks like (400, 410, an unparseable body).
+        comes back without a region. The fallback is deliberately narrow — an
+        ``UPSTREAM_ERROR`` whose ``cause`` is one of
+        :data:`DECORATION_RETRY_CAUSES`, which is what a rejected or withdrawn
+        decoration looks like (400, 410, an unparseable body).
 
         It must NOT retry a systemic failure. An expired session, a throttle or
         a challenge is a fact about the account: a second call cannot succeed,
@@ -1023,11 +1095,18 @@ class VoyagerClient:
         the condition worse. Nor a 404 — that is a statement about the member,
         not about the decoration. So the seven-call case is exactly "the
         decoration broke", and the ordinary paths still cost six.
+
+        The ``cause`` test is what makes that last sentence true rather than
+        approximately true. Story 4 could only test the *code*, and
+        ``UPSTREAM_ERROR`` also covers a 500, a 503 and a connection reset —
+        none of which the decoration had anything to do with, and each of which
+        bought a second doomed call. That was recorded as this story's to fix,
+        and it narrows the retry rather than widening it.
         """
         try:
             return await self._fetch_core_once(public_id, decorated=True)
         except ApiError as exc:
-            if exc.code != "UPSTREAM_ERROR":
+            if exc.code != "UPSTREAM_ERROR" or exc.cause not in DECORATION_RETRY_CAUSES:
                 raise
             logger.warning(
                 "Decorated core request failed (%s); retrying undecorated. "
@@ -1052,7 +1131,9 @@ class VoyagerClient:
             # PROFILE_NOT_FOUND: "we could not read this" and "this person does
             # not exist" are different claims and only one of them is true.
             raise self._upstream_error(
-                CORE_RESOURCE, "response was not a normalized collection envelope"
+                CORE_RESOURCE,
+                "response was not a normalized collection envelope",
+                cause=CAUSE_MALFORMED_BODY,
             )
 
         if not element_urns(payload):
@@ -1187,14 +1268,20 @@ class VoyagerClient:
                 self._transport, url, self._headers(), self._timeout
             )
         except TransportError as exc:
-            raise self._upstream_error(resource, f"transport failed: {self._safe(exc)}")
+            raise self._upstream_error(
+                resource,
+                f"transport failed: {self._safe(exc)}",
+                cause=CAUSE_TRANSPORT,
+            )
         except ApiError:
             raise
         except Exception as exc:
             # A transport that raises something unexpected must not become a
             # naked 500. CAP-6 permits no unhandled exception to reach a caller.
             raise self._upstream_error(
-                resource, f"transport raised {type(exc).__name__}: {self._safe(exc)}"
+                resource,
+                f"transport raised {type(exc).__name__}: {self._safe(exc)}",
+                cause=CAUSE_TRANSPORT,
             )
 
         try:
@@ -1212,6 +1299,7 @@ class VoyagerClient:
             raise self._upstream_error(
                 resource,
                 f"classifying the response raised {type(exc).__name__}: {self._safe(exc)}",
+                cause=CAUSE_MALFORMED_BODY,
             )
 
     def _classify(self, response: VoyagerResponse, *, resource: str) -> dict[str, Any]:
@@ -1229,6 +1317,8 @@ class VoyagerClient:
         3. **410 loudly.** An endpoint being withdrawn is the failure mode this
            whole story exists because of, and the one that must never be
            mistaken for an empty profile.
+        4. **A challenge on ``me`` is not a challenge.** See the branch — it is
+           the one place the resource, not the response, decides the code.
         """
         status = response.status
 
@@ -1254,10 +1344,45 @@ class VoyagerClient:
             )
 
         if status == LINKEDIN_BOT_STATUS:
+            # Deliberately NOT split by resource the way the wall below is. 999
+            # means "we think you are a bot": it is a statement about where the
+            # request came from, decided at the edge before any session is
+            # considered, and it arrives identically for a brand-new cookie and
+            # a dead one. Reporting it as SESSION_EXPIRED would send a caller to
+            # replace a credential that works, which is the same class of lie as
+            # the one this story is fixing, pointed the other way.
             raise self._challenge(resource, f"status {LINKEDIN_BOT_STATUS}")
 
         challenge = self._challenge_reason(response)
         if challenge is not None:
+            if resource == ME_RESOURCE:
+                # `me` IS NOT LIKE A PROFILE FETCH, and this asymmetry is the
+                # whole justification for the branch.
+                #
+                # A wall on a profile URL says nothing about the cookie:
+                # LinkedIn serves that page to perfectly healthy sessions coming
+                # from a datacenter IP, which is what this service is. So a
+                # challenge there stays retryable and story 7 absorbs it.
+                #
+                # `me` describes the session's OWN OWNER. There is no third
+                # party involved, no profile whose visibility could be the
+                # explanation — the only question the request asks is "who is
+                # holding this cookie", and a wall in place of that answer is
+                # evidence about the cookie itself. Verified live: a
+                # deliberately dead `li_at` answers `me` with a 200 redirect to
+                # `/authwall`, which the previous classification reported as
+                # `UPSTREAM_CHALLENGE`. Retryable — so `PUT /api/v1/session`
+                # recorded "could not tell" and the caller was never told the
+                # value they had just pasted was already dead.
+                logger.info(
+                    "Voyager me answered with a wall (%s); treating it as a dead "
+                    "session rather than a challenge",
+                    self._safe(challenge),
+                )
+                raise ApiError(
+                    "SESSION_EXPIRED",
+                    log_detail=f"{ME_RESOURCE}: {self._safe(challenge)}",
+                )
             raise self._challenge(resource, challenge)
 
         if status == 404:
@@ -1276,21 +1401,40 @@ class VoyagerClient:
                 "app/linkedin/client.py is out of date and must be re-verified.",
                 resource,
             )
-            raise self._upstream_error(resource, "endpoint returned 410 Gone")
+            raise self._upstream_error(
+                resource, "endpoint returned 410 Gone", cause=CAUSE_GONE
+            )
+
+        if status == 400:
+            # Split out of the `!= 200` case below solely to carry the cause: a
+            # 400 is LinkedIn refusing the request as malformed, and the only
+            # thing this client ever sends that LinkedIn could call malformed is
+            # a decoration id it has withdrawn.
+            raise self._upstream_error(
+                resource, "returned 400 Bad Request", cause=CAUSE_BAD_REQUEST
+            )
 
         if status != 200:
-            raise self._upstream_error(resource, f"unexpected status {status}")
+            raise self._upstream_error(
+                resource,
+                f"unexpected status {status}",
+                cause=CAUSE_UNEXPECTED_STATUS,
+            )
 
         try:
             payload = json.loads(response.body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise self._upstream_error(
-                resource, f"body claimed JSON but did not parse: {type(exc).__name__}"
+                resource,
+                f"body claimed JSON but did not parse: {type(exc).__name__}",
+                cause=CAUSE_MALFORMED_BODY,
             ) from exc
 
         if not isinstance(payload, dict):
             raise self._upstream_error(
-                resource, f"payload is {type(payload).__name__}, not an object"
+                resource,
+                f"payload is {type(payload).__name__}, not an object",
+                cause=CAUSE_MALFORMED_BODY,
             )
         return payload
 
@@ -1367,11 +1511,17 @@ class VoyagerClient:
     # -- Error builders -------------------------------------------------------
 
     def _upstream_error(
-        self, resource: str, detail: str, *, code: str = "UPSTREAM_ERROR"
+        self,
+        resource: str,
+        detail: str,
+        *,
+        code: str = "UPSTREAM_ERROR",
+        cause: str | None = None,
+        retryable: bool | None = None,
     ) -> ApiError:
         message = f"{resource}: {self._safe(detail)}"
         logger.warning("Voyager %s", message)
-        return ApiError(code, log_detail=message)
+        return ApiError(code, log_detail=message, cause=cause, retryable=retryable)
 
     def _challenge(self, resource: str, detail: str) -> ApiError:
         message = f"{resource}: {self._safe(detail)}"

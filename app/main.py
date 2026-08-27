@@ -124,6 +124,14 @@ def create_app() -> FastAPI:
     # theirs there and inherit auth the same way.
     application.include_router(v1.router)
 
+    # LAST, and it has to be: it matches every remaining path under `/api/v1`,
+    # so anything registered after it is unreachable. It closes the one hole the
+    # router-level dependency cannot — routing runs before dependencies, so a
+    # path with no route was answering 404 to callers with no token while a real
+    # path answered 401, which let the API's surface be read off the status code
+    # by somebody who had not authenticated. See `app/api/v1/__init__.py`.
+    v1.install_unmatched_path_guard(application)
+
     return application
 
 

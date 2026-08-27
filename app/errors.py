@@ -5,8 +5,8 @@ whole taxonomy would adopt. Story 4 adds the seven upstream rows, which is
 precisely the generalisation that was predicted: rows in :data:`ERROR_SPECS`,
 and nothing about this module's structure, the wire shape, or any call site
 written against it changed. The table is now complete against
-``response-schema.md``; story 8's remaining work is wiring codes to routes, not
-inventing new ones.
+``response-schema.md`` and story 8 invented no new rows either: what it changed
+is *what is classified as what*, and one thing about this module.
 
 The wire shape is fixed and is not negotiable per code::
 
@@ -15,6 +15,12 @@ The wire shape is fixed and is not negotiable per code::
 ``retryable`` exists so a client can decide without parsing prose, which is why
 it lives in the spec table next to the status rather than being inferred from
 the status class.
+
+The one thing story 8 changed here: **``retryable`` is a property of the
+response, not of the code.** :data:`ERROR_SPECS` still fixes every code's
+default and remains a byte-for-byte transcription of the contract's table, but a
+named raise site may *narrow* its own instance — see :class:`ApiError`. One
+condition needs it, and the alternative was a new contract row.
 """
 
 from __future__ import annotations
@@ -170,6 +176,42 @@ class ApiError(Exception):
     Carrying the code (not the status) as the identity keeps call sites honest:
     a route says *what went wrong*, and this module owns what that means on the
     wire.
+
+    ===========================================================================
+    ``retryable`` IS A PROPERTY OF THE RESPONSE, NOT OF THE CODE
+    ===========================================================================
+
+    :data:`ERROR_SPECS` still fixes the **default** for every code, and that
+    default is ``response-schema.md``'s column, untouched. What story 8 adds is
+    a per-*instance* override, because one real condition needs it: a response
+    naming a different member than the caller asked for is an ``UPSTREAM_ERROR``
+    — the table marks that retryable — and it is emphatically not. A vanity URL
+    that now belongs to somebody else does not stop belonging to them because
+    you asked twice, and under an unbounded cache `retryable: true` means the
+    stale record is republished for ever while nobody is ever told the URL
+    changed meaning.
+
+    Three rules keep this from becoming a hole in the taxonomy:
+
+    * **It can only narrow.** Making a non-retryable code retryable is refused
+      here, loudly, because that is the direction that hides a permanent
+      failure behind a cached 200 — the exact bug this codebase has already had
+      to fix once. The story's Boundaries put that change behind Ask First; this
+      raise is what makes "behind Ask First" mean something at runtime.
+    * **Every gate reads the effective value.** :attr:`retryable`, never
+      ``.spec.retryable``. An override that some gate does not consult changes
+      the body and not the behaviour, which is worse than no override at all —
+      ``tests/test_cache.py`` greps for that mistake.
+    * **It is used only at named raise sites**, pinned by a test, so it stays a
+      reclassification of two specific guards rather than a general escape
+      hatch a later call site can reach for.
+
+    ``cause`` is the other half of the same story. ``_classify`` in
+    :mod:`app.linkedin.client` collapses a 400, a 410, an unexpected status and
+    an unparseable body into one ``UPSTREAM_ERROR``; ``cause`` says which,
+    so the decorated-core retry can fire for a refused decoration and not for a
+    LinkedIn outage. Like ``log_detail`` it is **operator-only** and never
+    reaches a client-facing body.
     """
 
     def __init__(
@@ -179,23 +221,52 @@ class ApiError(Exception):
         message: str | None = None,
         headers: Mapping[str, str] | None = None,
         log_detail: str | None = None,
+        retryable: bool | None = None,
+        cause: str | None = None,
     ) -> None:
         if code not in ERROR_SPECS:
             raise KeyError(f"{code!r} is not in ERROR_SPECS — add it to the taxonomy first")
         self.code = code
         self.spec = ERROR_SPECS[code]
+        if retryable and not self.spec.retryable:
+            raise ValueError(
+                f"{code} is non-retryable in response-schema.md and a raise site "
+                "may not make it retryable. Telling a caller to repeat a request "
+                "that cannot succeed is how a permanent failure — a dead session "
+                "above all — ends up hidden behind a stale cached answer."
+            )
         self.message = message or self.spec.message
         self.headers = dict(headers) if headers else None
+        #: ``None`` means "whatever the table says". Read through
+        #: :attr:`retryable`, never directly.
+        self._retryable_override = retryable
         #: Operator-facing reason. Deliberately NOT part of the response body.
         self.log_detail = log_detail
-        super().__init__(f"{code}: {self.log_detail or self.message}")
+        #: Operator-facing discriminator within one code. Also NOT in the body.
+        self.cause = cause
+        detail = self.log_detail or self.message
+        super().__init__(f"{code}[{cause}]: {detail}" if cause else f"{code}: {detail}")
+
+    @property
+    def retryable(self) -> bool:
+        """Whether repeating *this* request could succeed. **The only gate.**
+
+        Anything that decides behaviour on retryability reads this. The code's
+        default lives on :attr:`spec` and is the input to this answer, not the
+        answer.
+        """
+        if self._retryable_override is None:
+            return self.spec.retryable
+        return self._retryable_override
 
     def to_response(self) -> JSONResponse:
         body = ErrorEnvelope(
             error=ErrorDetail(
                 code=self.code,
                 message=self.message,
-                retryable=self.spec.retryable,
+                # The effective value, so the wire and the cache gate can never
+                # disagree about whether the caller should try again.
+                retryable=self.retryable,
             )
         )
         return JSONResponse(
@@ -243,8 +314,16 @@ def unauthenticated(
 # and deletes what it supersedes. What it must NOT do is delete the fallback
 # itself — a path with no route at all can still 404, and that 404 still has
 # to wear the envelope.
+#
+# Story 8 dropped exactly one row, `400: BAD_REQUEST`. Every 400 this API can
+# answer is now `INVALID_URL` from the profile route — a real taxonomy code with
+# a real meaning — so the fallback row could only ever have fired for a 400
+# nothing raises, and keeping a code around for a status the taxonomy owns is
+# how the fallback set drifts back into being a second, worse taxonomy. The
+# other four rows are NOT superseded and stay: 404 and 405 are reachable with no
+# route at all, 422 is request validation, and 503 is this service's own
+# datastore, which `response-schema.md` has no row for by design.
 FALLBACK_CODES: dict[int, str] = {
-    400: "BAD_REQUEST",
     404: "NOT_FOUND",
     405: "METHOD_NOT_ALLOWED",
     422: "INVALID_REQUEST",
@@ -263,7 +342,6 @@ FALLBACK_CODE = "INTERNAL_ERROR"
 #: is a pydantic dump that can echo a submitted LinkedIn session cookie back
 #: into the response body.
 FALLBACK_MESSAGES: dict[int, str] = {
-    400: "The request could not be understood.",
     404: "No such resource.",
     405: "That method is not allowed on this resource.",
     422: "The request failed validation.",
@@ -285,10 +363,14 @@ def envelope(
 
     ``retryable`` is derived rather than chosen: a 5xx means the server failed
     and repeating the identical request may well work, a 4xx means the request
-    itself was wrong and repeating it verbatim cannot help. Story 8 overrides
-    this per code — `RATE_LIMITED` is a 429 that *is* retryable — which is
-    exactly why :class:`ErrorSpec` carries the flag explicitly and this
-    fallback only guesses for codes that have no spec row yet.
+    itself was wrong and repeating it verbatim cannot help.
+
+    **This guess is only ever used for the fallback codes**, which have no spec
+    row and cannot have one — see :data:`FALLBACK_CODES`. A taxonomy code never
+    comes through here: it renders through :meth:`ApiError.to_response`, which
+    reads the effective per-response value. That is why the guess can be as
+    crude as a status comparison and why `RATE_LIMITED`, a 429 that *is*
+    retryable, is not a counter-example to it.
     """
     body = ErrorEnvelope(
         error=ErrorDetail(
@@ -403,6 +485,26 @@ UNAUTHENTICATED_RESPONSE: dict[int | str, dict[str, Any]] = {
     401: {
         "model": ErrorEnvelope,
         "description": "Missing, malformed, expired, wrong-issuer or wrong-audience token.",
+    }
+}
+
+
+#: The other answer the authentication boundary can give, and the reason story 8
+#: exists: *this service* could not reach the identity provider.
+#:
+#: That used to be a 401, which tells a caller holding a perfectly good token to
+#: stop asking — a statement about their credential that this service is in no
+#: position to make when it could not read the realm's key set. It is a 502 with
+#: `retryable: true`, and it is reachable from every route under `/api/v1`,
+#: which is why it is attached at the router beside the 401 rather than
+#: enumerated per route.
+IDP_UNAVAILABLE_RESPONSE: dict[int | str, dict[str, Any]] = {
+    502: {
+        "model": ErrorEnvelope,
+        "description": (
+            "`UPSTREAM_ERROR` — the identity provider could not be reached to "
+            "validate the token. Retryable; the token is not being refused."
+        ),
     }
 }
 

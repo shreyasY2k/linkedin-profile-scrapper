@@ -18,8 +18,14 @@ checked, because JWS gives no other way to choose a key — but only ``alg`` and
 ``kid`` are taken from it, both are used solely to select a key, and neither
 can make an invalid signature verify.
 
-Every failure lands on the same 401 ``UNAUTHENTICATED`` envelope with the same
-message. The specific reason is logged, never returned.
+Every failure *of the token* lands on the same 401 ``UNAUTHENTICATED`` envelope
+with the same message. The specific reason is logged, never returned.
+
+There is exactly one failure here that is not a failure of the token, and story
+8 separated it out: **this process could not read the realm's key set at all.**
+That answers ``UPSTREAM_ERROR`` / 502 / ``retryable: true`` instead, because a
+401 is a claim about somebody's credential and no credential was ever checked —
+see :class:`JwksUnavailable`.
 """
 
 from __future__ import annotations
@@ -164,7 +170,33 @@ JWKS_MAX_BYTES = 1_048_576
 
 
 class SigningKeyUnavailable(Exception):
-    """No usable signature key for this ``kid`` — unknown, or JWKS unreachable."""
+    """This realm's JWKS was readable and does not publish this ``kid``.
+
+    A statement about the **token**: it was signed by a key this realm has never
+    published, which is what a foreign realm's token looks like. 401.
+    """
+
+
+class JwksUnavailable(Exception):
+    """This process could not obtain a usable key set at all.
+
+    A statement about **Keycloak**, not about the token — and the distinction is
+    the reason this class exists. Both conditions used to raise
+    :class:`SigningKeyUnavailable` and land on the same 401, so a Keycloak
+    outage told every caller holding a perfectly valid token that their
+    credential was bad and not to bother retrying. That is a claim this service
+    is in no position to make when it could not read the realm's keys: it did
+    not reject the token, it never checked it.
+
+    Routed to ``UPSTREAM_ERROR`` / 502 / ``retryable: true`` — the honest answer,
+    and the one a client can act on by trying again in a moment.
+
+    It covers every way the key set can fail to arrive, not only a refused
+    connection: a fetch that raised, a document that is not an object, a
+    document carrying no usable signature key, and — through
+    :meth:`JwksCache.signing_key` — a cache that holds nothing because an
+    earlier attempt failed and the refresh floor is suppressing another.
+    """
 
 
 def _fetch_jwks_over_http(url: str) -> dict[str, Any]:
@@ -235,15 +267,34 @@ class JwksCache:
         self._attempted_at: float | None = None
 
     def signing_key(self, kid: str) -> jwt.PyJWK:
-        """Return the signature key for ``kid``, refreshing when warranted."""
+        """Return the signature key for ``kid``, refreshing when warranted.
+
+        Two different failures, deliberately two different exceptions — see
+        :class:`JwksUnavailable`. The discriminator is *whether this process
+        holds a key set it could have checked ``kid`` against*:
+
+        * It does, and ``kid`` is not in it → :class:`SigningKeyUnavailable`.
+          The realm was reachable and does not publish this key. 401.
+        * It does not, or the refresh this call performed did not produce one →
+          :class:`JwksUnavailable`. Nothing has been decided about the token.
+          502, retryable.
+        """
         with self._lock:
             key = self._keys.get(kid)
             claimed = self._claim_refresh(kid, time.monotonic())
+            held = bool(self._keys)
 
         if not claimed:
-            if key is None:
+            if key is not None:
+                return key
+            # No fetch this time. Either the key set we hold does not name this
+            # kid, or we hold nothing at all — because an earlier attempt failed
+            # and the refresh floor is (correctly) suppressing another. The
+            # floor must not convert a Keycloak outage into a token rejection
+            # for the 30 seconds after the first failure.
+            if held:
                 raise SigningKeyUnavailable(kid)
-            return key
+            raise JwksUnavailable(self._url)
 
         # Outside the lock on purpose: see the class docstring. Other threads
         # meanwhile see the refresh slot already claimed and serve from cache
@@ -251,13 +302,21 @@ class JwksCache:
         document = self._fetch_document()
 
         with self._lock:
-            if document is not None:
+            installed = (
                 self._install(document, time.monotonic())
+                if document is not None
+                else False
+            )
             key = self._keys.get(kid)
+            held = bool(self._keys)
 
-        if key is None:
+        if key is not None:
+            return key
+        if installed and held:
+            # A key set arrived and this kid is not in it. The only branch that
+            # is genuinely a statement about the token.
             raise SigningKeyUnavailable(kid)
-        return key
+        raise JwksUnavailable(self._url)
 
     def _claim_refresh(self, kid: str, now: float) -> bool:
         """Decide whether *this* caller performs the fetch. Under the lock."""
@@ -281,10 +340,15 @@ class JwksCache:
         """Fetch the JWKS, or ``None`` if it could not be read. No lock held.
 
         The except clause is deliberately wide. A JWKS fetch failing must never
-        become a 500 — the matrix says 401, never 500 — and the ways this can
-        fail are open-ended: transport errors, TLS errors, a body that is not
-        JSON, a body that is not UTF-8, an oversized body. Catching
-        ``Exception`` here trades a precise clause for a guarantee that holds.
+        become a 500, and the ways this can fail are open-ended: transport
+        errors, TLS errors, a body that is not JSON, a body that is not UTF-8,
+        an oversized body. Catching ``Exception`` here trades a precise clause
+        for a guarantee that holds.
+
+        Returning ``None`` no longer means "reject the caller". It means "no key
+        set arrived", and :meth:`JwksCache.signing_key` turns that into
+        :class:`JwksUnavailable` — a 502 about Keycloak — rather than into a
+        401 about a token nobody managed to check.
         """
         try:
             document = self._fetch(self._url)
@@ -303,8 +367,14 @@ class JwksCache:
             return None
         return document
 
-    def _install(self, document: dict[str, Any], now: float) -> None:
-        """Adopt a fetched key set. Under the lock."""
+    def _install(self, document: dict[str, Any], now: float) -> bool:
+        """Adopt a fetched key set. Under the lock.
+
+        Returns whether a usable set was actually adopted, which is half of the
+        401-versus-502 decision in :meth:`signing_key`: a document that empties
+        under this filter tells us nothing about any ``kid``, so a token cannot
+        be refused on the strength of it.
+        """
         keys = _signature_keys(document)
         if not keys:
             # Not merely "nothing to add" — the existing keys must SURVIVE. A
@@ -312,11 +382,12 @@ class JwksCache:
             # empties, and replacing the cache with {} would 401 every caller
             # until the next refresh window.
             logger.error("JWKS at %s contained no usable signature key", self._url)
-            return
+            return False
 
         self._keys = keys
         self._loaded_at = now
         logger.info("Loaded %d signature key(s) from %s", len(keys), self._url)
+        return True
 
 
 def _signature_keys(document: dict[str, Any]) -> dict[str, jwt.PyJWK]:
@@ -485,8 +556,28 @@ def require_claims(
         key = jwks_cache.signing_key(kid)
     except SigningKeyUnavailable:
         # A foreign realm's token dies here: correctly signed, but by a key this
-        # realm's JWKS has never published.
+        # realm's JWKS has never published. The realm ANSWERED — that is what
+        # separates this branch from the one below, and what makes 401 an honest
+        # thing to say about the token.
         raise _reject(f"no published signature key for kid={_loggable(kid)}") from None
+    except JwksUnavailable as exc:
+        # Keycloak, not the caller. Nothing has been decided about this token:
+        # it was never checked, because the keys to check it against could not
+        # be read. Answering 401 here — which is what this did until story 8 —
+        # tells a caller holding a perfectly good credential that it is bad and
+        # that retrying is pointless, during an outage where retrying is exactly
+        # the right thing to do. The 502 says what happened.
+        #
+        # The message is overridden because the taxonomy's default for this code
+        # names LinkedIn, which is not what failed. Neither the URL nor the
+        # underlying error reaches the caller: `_fetch_document` already logged
+        # the real reason at ERROR, where only an operator sees it.
+        logger.error("Cannot validate tokens: no signature keys available (%s)", exc)
+        raise ApiError(
+            "UPSTREAM_ERROR",
+            message="The identity provider could not be reached to validate the token.",
+            log_detail=f"JWKS unavailable: {_loggable(exc)}",
+        ) from None
 
     try:
         claims = jwt.decode(

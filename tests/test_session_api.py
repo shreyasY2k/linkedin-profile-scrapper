@@ -629,6 +629,46 @@ def test_the_verifier_reports_false_only_for_a_refused_session() -> None:
         VoyagerClient.check_session = original  # type: ignore[method-assign]
 
 
+def test_the_real_verifier_reads_an_authwall_on_me_as_a_dead_cookie() -> None:
+    """The story-8 matrix row, end to end through the shipping verifier.
+
+    LinkedIn does not always state a refusal as a refusal: a dead `li_at` is
+    answered with a redirect to `/authwall` carrying a **200**. Classified as a
+    challenge, that was "could not tell" — so a caller who had just pasted a
+    dead cookie was told nothing, and found out later as permanent staleness on
+    a profile request. `me` describes the session's own owner, so a wall in
+    place of that answer is evidence about the cookie, and the caller is told
+    now.
+
+    Driven through the real transport seam rather than by stubbing
+    `check_session`, because what is under test is the classification, and
+    stubbing the method skips exactly that.
+    """
+    import asyncio
+
+    from app.linkedin import client as linkedin_client
+
+    def walled(url: str, headers: dict[str, str], timeout: float) -> Any:
+        return linkedin_client.VoyagerResponse(
+            status=200,
+            url="https://www.linkedin.com/authwall?trk=x",
+            headers={"content-type": "text/html; charset=utf-8"},
+            body=b"<html><body>Join LinkedIn to continue</body></html>",
+        )
+
+    original = linkedin_client.urllib_transport
+    linkedin_client.urllib_transport = walled
+    try:
+        verdict = asyncio.run(session_routes.check_stored_session(COOKIE))
+    finally:
+        linkedin_client.urllib_transport = original
+
+    assert verdict is False, (
+        "a wall in place of `me`'s answer is a dead cookie, and the caller has "
+        "to be told while they are still looking at the PUT they just made"
+    )
+
+
 def test_a_malformed_cookie_is_never_sent_to_linkedin(
     client: TestClient, verifier: RecordingVerifier
 ) -> None:

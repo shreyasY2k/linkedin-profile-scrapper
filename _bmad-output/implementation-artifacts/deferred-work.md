@@ -39,6 +39,7 @@
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/3-keycloak-realm-and-jwt-validation.md`
   summary: A JWKS fetch failure is reported to the caller as 401 UNAUTHENTICATED, so a Keycloak outage looks to the evaluator like a bad token.
   evidence: Failing closed is correct and 500 is forbidden, but the honest code is UPSTREAM_ERROR/502, which belongs to story 8's taxonomy. app/auth.py already logs the real reason at ERROR; story 8 should map SigningKeyUnavailable-due-to-fetch-failure separately from unknown-kid.
+  status: RESOLVED by story 8 — app/auth.py now raises JwksUnavailable when no usable key set could be obtained (fetch failed, document unusable, or nothing held while the refresh floor suppresses a retry) and SigningKeyUnavailable only when a key set arrived and does not name the kid. The former answers 502 UPSTREAM_ERROR retryable true with a message naming the identity provider rather than LinkedIn; the latter still answers 401. Verified live against the deployed stack with keycloak stopped.
 
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/3-keycloak-realm-and-jwt-validation.md`
   summary: Keycloak's realm import runs with strategy IGNORE_EXISTING, so KEYCLOAK_CLIENT_SECRET in .env only takes effect on a realm that does not exist yet.
@@ -63,6 +64,7 @@
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/3-keycloak-realm-and-jwt-validation.md`
   summary: A Keycloak outage answers a perfectly valid token with 401 UNAUTHENTICATED, retryable false, telling the caller not to retry when retrying is exactly right.
   evidence: JWKS fetch failure is indistinguishable from a bad token in the current error table. Story 8 owns UPSTREAM_ERROR/502 and should route IdP unavailability there, and the README's enumerated 401 causes should gain this case.
+  status: RESOLVED by story 8 — same change as the entry above; the README's authentication section now states that a 401 is always about the token and that an unreachable Keycloak is a retryable 502 instead.
 
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/3-keycloak-realm-and-jwt-validation.md`
   summary: require_claims authenticates but never authorizes - no azp, scope, or role check beyond audience.
@@ -87,6 +89,7 @@
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/3-keycloak-realm-and-jwt-validation.md`
   summary: app/errors.py carries a fallback code set (NOT_FOUND, METHOD_NOT_ALLOWED, INVALID_REQUEST, BAD_REQUEST, INTERNAL_ERROR) that is deliberately disjoint from response-schema.md's taxonomy.
   evidence: Added in review pass 1 so that 404/405/422/500 wear the typed envelope, which nothing else guaranteed. They are shape insurance, not taxonomy. Story 8 should replace each with a real code (INVALID_URL for the validation case, UPSTREAM_ERROR for the failure case) and must NOT delete the fallback itself - a test keeps the two sets disjoint.
+  status: RESOLVED by story 8 — the 400/BAD_REQUEST row is gone, superseded by INVALID_URL, which is the only 400 this API can answer. The other four rows are NOT superseded and stay: 404 and 405 are reachable with no route at all, 422 is request validation and 503 is this service's own datastore, which response-schema.md has no row for by design. The disjointness test is untouched.
 
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/3-keycloak-realm-and-jwt-validation.md`
   summary: Logging is configured at a hardcoded INFO with no LOG_LEVEL variable.
@@ -99,6 +102,7 @@
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/2-walking-skeleton-deploy.md`
   summary: An unauthenticated caller can enumerate which /api/v1 paths exist, because a non-existent path returns 404 while a real one returns 401.
   evidence: Verified on the deployed host - GET /api/v1/x without a token returns 404 NOT_FOUND, since FastAPI resolves routing before router-level dependencies run. No data is exposed, but it distinguishes real routes from absent ones. Story 8 could normalise unmatched /api/v1 paths to 401.
+  status: RESOLVED by story 8 — app/api/v1/install_unmatched_path_guard registers a catch-all route at /api/v1/{unmatched_path:path} carrying the same require_claims dependency, mounted last in create_app. An unauthenticated request under the prefix is now 401 whether or not the path is real. An authenticated caller still gets a real 404, and a wrong method on a real route still gets 405 with Allow - the catch-all asks the routing table which methods actually answer rather than swallowing the distinction.
 
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
   summary: The Voyager endpoint map is verified against exactly one profile — the developer's own — so per-profile shape variation is untested.
@@ -153,6 +157,7 @@
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
   summary: The publicIdentifier mismatch guard raises UPSTREAM_ERROR, which is retryable, for a condition that is permanent.
   evidence: fetch_profile refuses when the core response names a different member than the URL asked for - correct, since answering with the wrong person is the worst possible failure and story 7 would cache it. But retryable=true means story 7 stale-serves the refusal indefinitely, the same trap as the expired-session misclassification. It should carry a non-retryable code. Story 8 owns the taxonomy and should reclassify it.
+  status: RESOLVED by story 8 — ApiError gained a per-instance retryable override that may only NARROW (widening a non-retryable code raises ValueError), and both member-mismatch guards use it. app/cache.py's gate now reads the effective ApiError.retryable, so the refusal is no longer stale-served; a test greps the whole app package to keep anything from deciding on .spec.retryable again.
 
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
   summary: A profile whose LinkedIn vanity URL has changed would be refused, because the guard compares the requested public id against the returned publicIdentifier by exact equality.
@@ -204,6 +209,7 @@
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/6-profile-extraction-and-schema-mapping.md`
   summary: A core request that fails with UPSTREAM_ERROR is retried once undecorated, so that one failure mode costs SEVEN calls rather than six.
   evidence: Required by author decision A2 — the decoration id is version-pinned and a brittle nicety must not take down the fetch. The retry is deliberately narrow and cannot be widened casually: systemic failures (SESSION_EXPIRED, RATE_LIMITED, UPSTREAM_CHALLENGE) are never retried, because a second call cannot succeed and spending one against an account LinkedIn is already throttling makes the condition worse; PROFILE_NOT_FOUND is not retried either, since a 404 is a statement about the member rather than about the decoration. The residual imprecision is that `_classify` collapses 400, 410, an unexpected status and a malformed envelope into one UPSTREAM_ERROR, so a genuine upstream 500 on the core also costs the extra call. Distinguishing them would mean carrying a cause on `ApiError`, which is story 8's taxonomy work. Pinned by `test_a_refused_decoration_falls_back_and_still_returns_the_profile` and three no-retry tests.
+  status: RESOLVED by story 8 — ApiError now carries an operator-only `cause`, and `_classify` sets one per branch (bad-request, gone, malformed-body, unexpected-status, transport, member-mismatch). The decorated-core retry fires only for DECORATION_RETRY_CAUSES = {bad-request, gone, malformed-body}, so a genuine 500, 503 or connection reset on the core no longer buys a second doomed call. The retry was narrowed, never widened; the cause set is a whitelist pinned by a test.
 
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/6-profile-extraction-and-schema-mapping.md`
   summary: A year-only `certifications[].issued` is still dropped to `null`.
@@ -216,6 +222,7 @@
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/6-profile-extraction-and-schema-mapping.md`
   summary: The endpoint's public-id cross-check and the client's `publicIdentifier` cross-check both raise UPSTREAM_ERROR, which is `retryable: true` for a permanent condition.
   evidence: Added by review finding B2 — the route now asserts `parse_profile_url(url)` against `raw.public_id`, so a redirect or substitution cannot publish one person's profile under another's URL in a response that agrees with itself. It inherits the misclassification already logged against story 4's guard: `retryable: true` means story 7 would stale-serve the refusal indefinitely. Story 8 owns the taxonomy and should give both guards a non-retryable code together.
+  status: RESOLVED by story 8 — the endpoint guard now raises with retryable=False as well, so the placement outside the stale-serve boundary is belt to that braces rather than the only thing holding it. The client's twin guard is narrowed identically.
 
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/6-profile-extraction-and-schema-mapping.md`
   summary: `_text` no longer truncates, so a single hostile or corrupt upstream field can be as large as the client's body cap allows.
@@ -224,6 +231,7 @@
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/7-response-cache-with-stale-serve.md`
   summary: A dead `li_at` whose authwall arrives as a 200 rather than a 401 is classified UPSTREAM_CHALLENGE, which is retryable, so an expired session is stale-served indefinitely and the caller is never told to store a new cookie.
   evidence: Found by this story's live verification against the deployed stack, not by the offline suite - a deliberately dead cookie against a cached profile returned `200 stale:true` instead of `428 SESSION_EXPIRED`. `app/linkedin/client.py:_classify` already ranks an explicit 401/403 refusal above the challenge check, naming this exact risk, but that ordering only helps when LinkedIn states the refusal in the status; here it redirects to `/authwall` and answers 200, and `_challenge_reason` cannot tell that page apart from the datacenter-IP challenge the same URL serves to a perfectly good session. This is NOT a contract deviation - `SPEC.md` says challenge pages are "absorbed by stale-serve" and the story's matrix asks for that 200 - so it was left alone rather than fixed from a story that does not own the taxonomy. Two follow-ups: story 8 should consider whether a challenge on the `me` resource specifically (which describes the session's own owner) is stronger evidence about the cookie than a challenge on a profile fetch, and story 9's Known limitations section should state plainly that a cookie can die in a way this service reports as staleness. Note `GET /api/v1/session` is honest about it either way - the `PUT` verification recorded `last_use_ok: null`, "could not tell", rather than claiming the cookie works.
+  status: PARTIALLY RESOLVED by story 8 — a wall served in place of the `me` resource's answer is now classified SESSION_EXPIRED rather than UPSTREAM_CHALLENGE, because `me` describes the session's own owner and a wall in reply to that question is evidence about the cookie. So PUT /api/v1/session reports last_use_ok:false the moment a dead cookie is stored. On a PROFILE fetch the two pages remain genuinely indistinguishable and the gap stands, as SPEC.md intends; LinkedIn's 999 bot status is deliberately still a challenge on both, since it is about this container's IP rather than the session. Story 9's Known limitations must still state the residual gap, plus the new one: `retryable` is a property of the response and the wire value is authoritative over response-schema.md's table for the member-mismatch case.
 
 - source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/7-response-cache-with-stale-serve.md`
   summary: The client's own publicIdentifier guard still raises a retryable UPSTREAM_ERROR for a permanent condition, even though the endpoint's guard no longer stale-serves.

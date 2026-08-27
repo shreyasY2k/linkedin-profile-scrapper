@@ -883,6 +883,46 @@ def test_a_core_response_naming_a_different_member_is_refused() -> None:
     assert error.code == "UPSTREAM_ERROR"
 
 
+def test_the_member_mismatch_refusal_is_not_retryable() -> None:
+    """The story-8 reclassification, at the guard that actually needed it.
+
+    This guard raises INSIDE the stale-serve boundary — it is part of the fetch
+    — so until story 8 it was the one member-mismatch that story 7's placement
+    could not protect: `UPSTREAM_ERROR` is retryable in `response-schema.md`, so
+    a cached record answered it with a 200 and the caller was never told that
+    the URL they asked about had stopped meaning what they think.
+
+    The code stays `UPSTREAM_ERROR`. The instance says `retryable: false`, and
+    that is what `app/cache.py` gates on — see
+    `test_an_error_narrowed_at_its_raise_site_is_not_served_from_the_cache`.
+    """
+    core = load_fixture("voyager_core.json")
+    core["included"][0]["publicIdentifier"] = "somebody-entirely-different"
+    client = make_client(override("core", json_response(core)))
+
+    error = expect_api_error(lambda: fetch(client))
+
+    assert error.retryable is False
+    assert error.spec.retryable is True, (
+        "the TABLE must be untouched — this is a per-response narrowing, not a "
+        "rewrite of response-schema.md"
+    )
+    assert error.cause == voyager.CAUSE_MEMBER_MISMATCH
+
+
+def test_the_member_mismatch_refusal_names_neither_member_to_the_caller() -> None:
+    """`message` is the taxonomy's, so the requested id and the substituted one
+    stay in the log where an operator reads them."""
+    core = load_fixture("voyager_core.json")
+    core["included"][0]["publicIdentifier"] = "somebody-entirely-different"
+    client = make_client(override("core", json_response(core)))
+
+    error = expect_api_error(lambda: fetch(client))
+
+    assert "somebody-entirely-different" not in error.message
+    assert PUBLIC_ID not in error.message
+
+
 def test_a_malformed_core_envelope_is_an_upstream_error_not_a_missing_person() -> None:
     """"We could not read this" and "this person does not exist" are different
     claims, and only one of them is true."""
@@ -1130,6 +1170,105 @@ def test_a_403_on_a_wall_url_is_also_expiry() -> None:
     assert expect_api_error(lambda: fetch(client)).code == "SESSION_EXPIRED"
 
 
+# --- `me` is not like a profile fetch ------------------------------------------
+#
+# The asymmetry, and it is the whole justification for the branch: a wall on a
+# profile URL says nothing about the cookie, because LinkedIn serves that page to
+# perfectly healthy sessions coming from a datacenter IP. `me` asks who is
+# holding this cookie, and a wall in place of that answer is about the cookie.
+#
+# Found live during story 4: a deliberately dead `li_at` answered `me` with a 200
+# redirect to `/authwall`, which classified as UPSTREAM_CHALLENGE — retryable —
+# so `PUT /api/v1/session` recorded "could not tell" and the caller was never
+# told the value they had just pasted was already dead.
+
+
+def me_client(outcome: Any) -> VoyagerClient:
+    return make_client([("/api/me", outcome)])
+
+
+def test_a_200_authwall_on_the_me_resource_is_a_dead_session() -> None:
+    """The story's matrix row, in the exact shape it was observed in."""
+    client = me_client(html_response(status=200, url="https://www.linkedin.com/authwall"))
+
+    error = expect_api_error(lambda: asyncio.run(client.check_session()))
+
+    assert error.code == "SESSION_EXPIRED"
+    assert error.spec.status_code == 428
+    assert error.retryable is False, "a retryable code here would be stale-served"
+
+
+@pytest.mark.parametrize(
+    "final_url",
+    [
+        "https://www.linkedin.com/checkpoint/challenge/verify",
+        "https://www.linkedin.com/uas/login?goback=x",
+        "https://www.linkedin.com/login",
+    ],
+)
+def test_any_wall_destination_on_me_is_a_dead_session(final_url: str) -> None:
+    """Destination alone, with a 200 carrying valid JSON behind it."""
+    client = me_client(json_response(load_fixture("voyager_me.json"), url=final_url))
+
+    assert expect_api_error(lambda: asyncio.run(client.check_session())).code == (
+        "SESSION_EXPIRED"
+    )
+
+
+def test_a_non_json_body_from_me_is_a_dead_session() -> None:
+    """The second challenge signal — a wall served in place at the requested URL."""
+    client = me_client(html_response(status=200, url="https://www.linkedin.com/voyager/api/me"))
+
+    assert expect_api_error(lambda: asyncio.run(client.check_session())).code == (
+        "SESSION_EXPIRED"
+    )
+
+
+def test_the_same_wall_on_a_profile_fetch_is_still_only_a_challenge() -> None:
+    """The asymmetry, asserted as a pair so neither half drifts alone.
+
+    Reporting a profile-fetch wall as expiry would send callers to replace a
+    credential that works — the same class of lie as the one being fixed,
+    pointed the other way — and would take stale-serve away from the case
+    `SPEC.md` explicitly says it covers.
+    """
+    profile_side = make_client(
+        override("core", html_response(status=200, url="https://www.linkedin.com/authwall"))
+    )
+    me_side = me_client(html_response(status=200, url="https://www.linkedin.com/authwall"))
+
+    assert expect_api_error(lambda: fetch(profile_side)).code == "UPSTREAM_CHALLENGE"
+    assert expect_api_error(
+        lambda: asyncio.run(me_side.check_session())
+    ).code == "SESSION_EXPIRED"
+
+
+def test_linkedins_bot_status_on_me_is_still_a_challenge() -> None:
+    """999 is deliberately NOT split by resource.
+
+    It means "we think you are a bot": a statement about where the request came
+    from, decided before any session is considered, and identical for a
+    brand-new cookie and a dead one. Reporting it as expiry would tell a caller
+    to replace a credential that is fine.
+    """
+    client = me_client(status_response(999))
+
+    error = expect_api_error(lambda: asyncio.run(client.check_session()))
+
+    assert error.code == "UPSTREAM_CHALLENGE"
+    assert error.retryable is True
+
+
+def test_a_transport_failure_on_me_is_not_a_verdict_about_the_cookie() -> None:
+    """The other thing that must not become SESSION_EXPIRED."""
+    client = me_client(voyager.TransportError("no route to host"))
+
+    error = expect_api_error(lambda: asyncio.run(client.check_session()))
+
+    assert error.code == "UPSTREAM_ERROR"
+    assert error.cause == voyager.CAUSE_TRANSPORT
+
+
 def test_a_challenge_is_not_reported_as_a_missing_profile() -> None:
     client = make_client(override("core", html_response()))
 
@@ -1291,6 +1430,83 @@ def test_a_systemic_failure_is_never_retried_undecorated(
 
     assert error.code == code
     assert len(core_calls(client)) == 1
+
+
+@pytest.mark.parametrize(
+    "outcome,cause",
+    [
+        (status_response(500), voyager.CAUSE_UNEXPECTED_STATUS),
+        (status_response(503), voyager.CAUSE_UNEXPECTED_STATUS),
+        (voyager.TransportError("connection reset"), voyager.CAUSE_TRANSPORT),
+    ],
+)
+def test_an_upstream_fault_is_not_retried_undecorated(outcome: Any, cause: str) -> None:
+    """The residual imprecision story 4 recorded, closed by `cause`.
+
+    A 500, a 503 and a connection reset are all `UPSTREAM_ERROR`, and the retry
+    used to fire for the code alone — so every LinkedIn outage bought a second
+    doomed call against an account that was already failing. None of them is
+    what a refused decoration looks like, and none of them earns the seventh
+    call. The retry is narrowed by this, never widened.
+    """
+    client = make_client(override("core", outcome))
+
+    error = expect_api_error(lambda: fetch(client))
+
+    assert error.code == "UPSTREAM_ERROR"
+    assert error.cause == cause
+    assert len(core_calls(client)) == 1, "an upstream fault must not cost a second call"
+
+
+@pytest.mark.parametrize(
+    "outcome,cause",
+    [
+        (status_response(400), voyager.CAUSE_BAD_REQUEST),
+        (status_response(410), voyager.CAUSE_GONE),
+        (status_response(200, body=b"not json at all"), voyager.CAUSE_MALFORMED_BODY),
+    ],
+)
+def test_only_a_refused_decoration_earns_the_second_call(
+    outcome: Any, cause: str
+) -> None:
+    """The positive half: what a withdrawn or revised decoration id looks like.
+
+    Asserted beside the negative so narrowing the retry to nothing at all —
+    which would silently drop `location.region` the next time LinkedIn revises
+    the id — fails a test too.
+    """
+    answered: list[str] = []
+
+    def core(url: str, headers: dict[str, str]) -> VoyagerResponse:
+        answered.append(url)
+        if voyager.CORE_DECORATION_ID in url:
+            return outcome
+        return json_response(load_fixture("voyager_core.json"))
+
+    client = make_client(override("core", core))
+
+    profile = fetch(client)
+
+    assert profile.public_id == PUBLIC_ID
+    assert len(answered) == 2 and voyager.CORE_DECORATION_ID not in answered[1]
+    assert cause in voyager.DECORATION_RETRY_CAUSES
+
+
+def test_the_causes_that_earn_a_retry_are_a_closed_set() -> None:
+    """Adding a cause to the retry must be a deliberate act.
+
+    A whitelist is what makes classifying something new as `UPSTREAM_ERROR` a
+    change that does NOT quietly widen the retry — which the story's boundaries
+    forbid outright.
+    """
+    assert voyager.DECORATION_RETRY_CAUSES == {
+        voyager.CAUSE_BAD_REQUEST,
+        voyager.CAUSE_GONE,
+        voyager.CAUSE_MALFORMED_BODY,
+    }
+    assert voyager.CAUSE_TRANSPORT not in voyager.DECORATION_RETRY_CAUSES
+    assert voyager.CAUSE_UNEXPECTED_STATUS not in voyager.DECORATION_RETRY_CAUSES
+    assert voyager.CAUSE_MEMBER_MISMATCH not in voyager.DECORATION_RETRY_CAUSES
 
 
 def test_an_unknown_profile_is_not_retried_undecorated() -> None:

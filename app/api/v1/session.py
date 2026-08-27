@@ -104,9 +104,18 @@ async def check_stored_session(cookie: str) -> bool | None:
     **Three outcomes, and the third is not a failure.** ``True`` — LinkedIn
     named the session's owner. ``False`` — LinkedIn refused the session, so the
     caller is told immediately that the value they pasted is dead. ``None`` —
-    a throttle, a challenge, a timeout, a DNS failure: none of those is
-    evidence about the cookie, and recording ``last_use_ok: false`` for them
+    a throttle, a timeout, a DNS failure, LinkedIn's bot status: none of those
+    is evidence about the cookie, and recording ``last_use_ok: false`` for them
     would libel a perfectly good session.
+
+    A **wall in place of an answer counts as a refusal here**, and only here.
+    ``me`` asks LinkedIn who is holding this cookie; an authwall in reply to
+    that question is about the cookie, and the client classifies it
+    ``SESSION_EXPIRED`` accordingly — see the branch in
+    ``app/linkedin/client.py:_classify``. The same page on a profile fetch means
+    nothing of the sort, which is why the split is by resource and lives there.
+    This is what closes the story-4 gap where a dead cookie was stored, verified
+    as "could not tell", and only discovered as permanent staleness later.
 
     This never raises. The credential is already stored by the time it runs, and
     a verification that could fail the request would mean a LinkedIn outage
@@ -125,7 +134,10 @@ async def check_stored_session(cookie: str) -> bool | None:
             logger.info("A freshly stored session was refused by LinkedIn")
             return False
         # RATE_LIMITED, UPSTREAM_CHALLENGE, UPSTREAM_ERROR, PROFILE_NOT_FOUND:
-        # facts about LinkedIn or about the network, not about the cookie.
+        # facts about LinkedIn or about the network, not about the cookie. A
+        # challenge reaching here now means the 999 bot status specifically —
+        # a statement about this container's IP — since a wall served in place
+        # of `me`'s answer is classified as expiry above.
         logger.info(
             "Could not verify a stored session (%s); leaving validity unknown",
             exc.code,
@@ -221,6 +233,21 @@ SESSION_ERRORS: dict[int | str, dict[str, Any]] = {
     503: {
         "model": ErrorEnvelope,
         "description": "`SERVICE_UNAVAILABLE` — the session store could not be reached.",
+    },
+    # A 502 from a session route is never about LinkedIn: neither handler's
+    # ANSWER depends on it (`PUT` stores first and verifies best-effort, and a
+    # verification that cannot reach a verdict leaves `last_use_ok` null rather
+    # than failing). It is the authentication boundary — the identity provider
+    # could not be reached to validate the token. Retryable, and stated here
+    # because the router-level entry would otherwise be the only mention and
+    # would read as though LinkedIn were involved.
+    502: {
+        "model": ErrorEnvelope,
+        "description": (
+            "`UPSTREAM_ERROR` — the identity provider could not be reached to "
+            "validate the token. Retryable; your token is not being refused, "
+            "and your stored session is untouched."
+        ),
     },
 }
 

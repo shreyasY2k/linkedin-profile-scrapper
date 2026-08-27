@@ -293,6 +293,77 @@ def test_the_retryable_flag_comes_from_the_taxonomy_rather_than_a_second_list() 
     ), "response-schema.md's retryable column changed; re-read this file's docstring"
 
 
+# --- The gate reads the EFFECTIVE flag, not the code's default ---------------
+#
+# Story 8 made `retryable` a per-response property: `ERROR_SPECS` still fixes
+# every code's default, and two named raise sites narrow their own instance
+# because the condition they report — a response naming a different member — is
+# permanent while `UPSTREAM_ERROR` is not.
+#
+# That override is inert unless every gate reads it, and this is the only gate.
+# Reading `error.spec.retryable` here would be worse than not overriding at all:
+# the caller would be handed a stale 200 whose body said `retryable: false`.
+
+
+def test_an_error_narrowed_at_its_raise_site_is_not_served_from_the_cache(
+    cache: ProfileCache, store: InMemoryProfileCacheStore
+) -> None:
+    """The matrix row that decides it: a record EXISTS and must not be served.
+
+    With an empty cache this passes however the gate is written, which is
+    exactly how the misclassification survived stories 4 and 7.
+    """
+    remember(cache, envelope())
+
+    fallback = cache.fallback_for(
+        PUBLIC_ID,
+        ApiError("UPSTREAM_ERROR", retryable=False, log_detail="different member"),
+    )
+
+    assert fallback.body is None
+    assert fallback.reason == NOT_RETRYABLE
+    assert store.loads == [], "a permanent failure must not even read the record"
+
+
+def test_the_same_code_left_alone_is_still_served(cache: ProfileCache) -> None:
+    """The negative above must fail for the override, not for the code.
+
+    Without this, deleting the whole `UPSTREAM_ERROR` branch would leave the
+    test above green while breaking CAP-5 for every genuine upstream fault.
+    """
+    remember(cache, envelope())
+
+    fallback = cache.fallback_for(PUBLIC_ID, error("UPSTREAM_ERROR"))
+
+    assert fallback.body is not None
+    assert fallback.reason == SERVED
+
+
+def test_nothing_decides_behaviour_on_a_codes_default_retryability() -> None:
+    """The design note, as a grep: `.spec.retryable` must decide nothing.
+
+    A second gate reading the code's default would silently ignore an override
+    — and the symptom, a stale 200 whose own body says the failure is
+    permanent, is one nobody would think to look for. `app/errors.py` is the
+    single legitimate reader: it is where the default is turned into the
+    effective value in the first place.
+    """
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    readers = {
+        path.relative_to(repo_root).as_posix()
+        for path in sorted((repo_root / "app").rglob("*.py"))
+        if ".spec.retryable" in path.read_text(encoding="utf-8")
+    }
+
+    assert readers <= {"app/errors.py"}, (
+        f"{sorted(readers)} read a code's DEFAULT retryability. Read "
+        "`ApiError.retryable` instead — the override is not a suggestion, and a "
+        "gate that ignores it changes the body without changing the behaviour."
+    )
+
+
 def test_there_is_no_public_way_to_read_the_cache_past_the_retryable_gate() -> None:
     """The module says the rule lives in exactly one place; this makes that true.
 

@@ -36,9 +36,12 @@ from fastapi import APIRouter, Depends
 from fastapi.testclient import TestClient
 
 from app import auth
+from app import errors as app_errors
+from app.api import v1
 from app.api.v1 import router as v1_router
 from app.auth import require_claims
 from app.config import settings
+from app.errors import ApiError
 from app.main import create_app
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -676,15 +679,63 @@ def test_an_ordinary_subject_is_still_accepted(client: TestClient) -> None:
 # --- Failing closed ----------------------------------------------------------
 
 
-def test_an_unreachable_jwks_rejects_rather_than_500(
+def test_an_unreachable_jwks_refuses_the_request_without_blaming_the_token(
     client: TestClient, fetcher: RecordingFetcher
 ) -> None:
-    """Keycloak down must never mean "let it through", and never mean a 500."""
+    """Keycloak down must never mean "let it through", and never mean a 500.
+
+    Nor a 401. The token here is perfectly valid — this is the story-8 matrix
+    row — and it was never checked: the keys to check it against could not be
+    read. A 401 tells its holder to stop asking, which is a claim about their
+    credential that this service is in no position to make. It is a retryable
+    502 about the identity provider, and the request is still refused.
+    """
     fetcher.error = OSError("connection refused")
 
     response = client.get(PROBE_PATH, headers=bearer(make_token()))
 
-    assert response.status_code != 500, response.text
+    _assert_envelope(response, 502, retryable=True)
+    assert response.json()["error"]["code"] == "UPSTREAM_ERROR"
+    # Never the reason, the URL, or anything else about the realm's topology.
+    assert "connection refused" not in response.text
+    assert settings.keycloak_server_url not in response.text
+
+
+def test_an_unreachable_jwks_still_refuses_while_the_refresh_floor_holds(
+    client: TestClient, fetcher: RecordingFetcher
+) -> None:
+    """The second request, inside the 30s floor, must answer the same way.
+
+    The floor suppresses the refetch, so this request reaches the "no fetch
+    happened" branch with an empty cache rather than the "the fetch failed"
+    one. Both mean Keycloak, and reading only the first would leave a 401 —
+    the exact bug — for every request in the half-minute after the first
+    failure, which is most of them.
+    """
+    fetcher.error = OSError("connection refused")
+
+    first = client.get(PROBE_PATH, headers=bearer(make_token()))
+    second = client.get(PROBE_PATH, headers=bearer(make_token()))
+
+    assert fetcher.calls == 1, "the refresh floor did not suppress the second fetch"
+    _assert_envelope(first, 502, retryable=True)
+    _assert_envelope(second, 502, retryable=True)
+
+
+def test_a_key_set_that_arrived_still_refuses_an_unknown_kid_as_a_401(
+    client: TestClient, fetcher: RecordingFetcher
+) -> None:
+    """The other half of the split, asserted beside it so neither drifts.
+
+    The realm ANSWERED and does not publish this key. That is a statement about
+    the token, and it must not regress into a 502 — a foreign realm's token
+    would then be told to try again.
+    """
+    token = make_token(key=_FOREIGN_KEY, kid=FOREIGN_KID)
+
+    response = client.get(PROBE_PATH, headers=bearer(token))
+
+    assert fetcher.calls >= 1, "the realm must actually have been consulted"
     assert_unauthenticated(response)
 
 
@@ -832,13 +883,38 @@ def test_a_malformed_jwks_entry_is_skipped_not_raised(entry: dict) -> None:
 def test_a_jwks_that_is_not_an_object_rejects_rather_than_500(
     client: TestClient, fetcher: RecordingFetcher, document: object
 ) -> None:
-    """`document.get(...)` on a parsed list is an AttributeError, i.e. a 500."""
+    """`document.get(...)` on a parsed list is an AttributeError, i.e. a 500.
+
+    Answered the same way as an unreachable Keycloak, and for the same reason:
+    a key set that did not arrive in a usable form is a fact about the realm,
+    and no token was checked against it. A misconfigured or mid-deploy realm
+    telling every valid caller their credential is bad is the failure this
+    split exists to prevent, and it does not become less wrong because the
+    connection succeeded.
+    """
     fetcher.document = document
 
     response = client.get(PROBE_PATH, headers=bearer(make_token()))
 
-    assert response.status_code != 500, response.text
-    assert_unauthenticated(response)
+    _assert_envelope(response, 502, retryable=True)
+    assert response.json()["error"]["code"] == "UPSTREAM_ERROR"
+
+
+def test_a_realm_publishing_no_usable_signature_key_is_not_the_callers_fault(
+    client: TestClient, fetcher: RecordingFetcher
+) -> None:
+    """A document that this filter empties — a realm mid-rotation.
+
+    It parses, it is well formed, and it names no key any token could be
+    verified against. Nothing has been decided about the token.
+    """
+    fetcher.document = {
+        "keys": [_public_jwk(_FOREIGN_KEY, "enc-only", use="enc", alg="RSA-OAEP")]
+    }
+
+    response = client.get(PROBE_PATH, headers=bearer(make_token()))
+
+    _assert_envelope(response, 502, retryable=True)
 
 
 @pytest.mark.parametrize("broken", ["exp", "iat", "nbf"])
@@ -1133,6 +1209,272 @@ def test_the_fallback_codes_are_not_mistaken_for_taxonomy_rows() -> None:
     assert "UNAUTHENTICATED" in ERROR_SPECS
     assert not set(FALLBACK_CODES.values()) & set(ERROR_SPECS)
     assert FALLBACK_CODE not in ERROR_SPECS
+
+
+def test_the_fallback_no_longer_carries_a_code_the_taxonomy_owns() -> None:
+    """Story 8 shrank the set by exactly one row, and only that one.
+
+    Every 400 this API can answer is `INVALID_URL`, a real code with a real
+    meaning, so a `BAD_REQUEST` fallback could only ever have fired for a 400
+    nothing raises. The other four rows are NOT superseded and deleting any of
+    them would put a naked `{"detail": ...}` back on a reachable path — which
+    is the failure the whole fallback exists to prevent, and which the story's
+    boundaries forbid.
+    """
+    from app.errors import FALLBACK_CODES, FALLBACK_MESSAGES
+
+    assert 400 not in FALLBACK_CODES
+    assert 400 not in FALLBACK_MESSAGES
+    assert set(FALLBACK_CODES) == {404, 405, 422, 503}
+
+
+# --- Every taxonomy code, on the wire -----------------------------------------
+#
+# `tests/test_linkedin_client.py` pins ERROR_SPECS against a hand-transcribed
+# copy of `response-schema.md`. That says the TABLE is right and nothing about
+# what a caller receives — four codes had their status asserted over HTTP and
+# four did not, and `retryable` was asserted on the wire for none of them.
+#
+# This closes the composition: hand-transcribed spec == ERROR_SPECS (there) and
+# ERROR_SPECS == what comes back over HTTP (here), so the wire agrees with the
+# published contract by two independent steps rather than by assumption. It is
+# derived from ERROR_SPECS deliberately — a second hand transcription here would
+# be a second thing to keep in step, and the first one is already the pin.
+
+
+def _raise_over_http(error: ApiError) -> Any:
+    """Provoke `error` from a real route and return the client's response."""
+    probe = APIRouter()
+
+    @probe.get("/__taxonomy__")
+    async def _raiser() -> None:
+        raise error
+
+    saved = list(v1_router.routes)
+    v1_router.include_router(probe)
+    try:
+        client = TestClient(create_app(), raise_server_exceptions=False)
+        return client.get("/api/v1/__taxonomy__", headers=bearer(make_token()))
+    finally:
+        v1_router.routes[:] = saved
+
+
+@pytest.mark.parametrize("code", sorted(app_errors.ERROR_SPECS))
+def test_every_taxonomy_code_wears_the_envelope_on_the_wire(
+    fetcher: RecordingFetcher, code: str
+) -> None:
+    """All eight, and `retryable` among them. The story's third criterion."""
+    spec = app_errors.ERROR_SPECS[code]
+
+    response = _raise_over_http(ApiError(code))
+
+    _assert_envelope(response, spec.status_code, retryable=spec.retryable)
+    assert response.json()["error"]["code"] == code
+    assert response.json()["error"]["message"] == spec.message
+    # Every error is caller-specific and none of them may be cached by the
+    # nginx / load balancer / Cloudflare chain in front of this service.
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_a_narrowed_error_reports_its_own_retryability_not_its_codes(
+    fetcher: RecordingFetcher,
+) -> None:
+    """The deliberate contract deviation, asserted where a client reads it.
+
+    `response-schema.md` marks `UPSTREAM_ERROR` retryable. A member-mismatch
+    returns that code with `retryable: false`, and the wire value is the
+    authoritative one — which is exactly why a client is told to branch on the
+    flag rather than on the code.
+    """
+    response = _raise_over_http(
+        ApiError("UPSTREAM_ERROR", retryable=False, cause="member-mismatch")
+    )
+
+    _assert_envelope(response, 502, retryable=False)
+    assert response.json()["error"]["code"] == "UPSTREAM_ERROR"
+
+
+def test_the_operator_only_fields_never_reach_the_body(
+    fetcher: RecordingFetcher,
+) -> None:
+    """`cause` joins `log_detail` on the operator side of the line.
+
+    Both name internals — a resource path, a classification branch — and the
+    envelope has exactly three keys. A fourth appearing here would be a contract
+    break; a value leaking into `message` would be an information leak.
+    """
+    response = _raise_over_http(
+        ApiError(
+            "UPSTREAM_ERROR",
+            cause="malformed-body",
+            log_detail="identity/dash/profiles: secret-ish internal detail",
+        )
+    )
+
+    assert set(response.json()["error"]) == {"code", "message", "retryable"}
+    assert "malformed-body" not in response.text
+    assert "secret-ish internal detail" not in response.text
+
+
+def test_a_raise_site_cannot_make_a_permanent_failure_retryable() -> None:
+    """The override narrows and only narrows.
+
+    Widening is what hides a permanent failure behind a cached 200 — telling a
+    caller whose session is dead to try again is the bug this codebase has
+    already had to fix once. The story's boundaries put that change behind Ask
+    First; this raise is what makes that mean something at runtime rather than
+    in a document.
+    """
+    for code in ("SESSION_EXPIRED", "NO_SESSION", "PROFILE_NOT_FOUND", "INVALID_URL"):
+        with pytest.raises(ValueError):
+            ApiError(code, retryable=True)
+
+    # Narrowing an already-retryable code is the permitted direction.
+    assert ApiError("UPSTREAM_ERROR", retryable=False).retryable is False
+    # And an untouched instance still answers with its code's default.
+    assert ApiError("UPSTREAM_ERROR").retryable is True
+    assert ApiError("SESSION_EXPIRED").retryable is False
+
+
+#: Where a per-instance `retryable` override may be written, and nowhere else.
+#:
+#: The story's design note: the override is reachable only from named raise
+#: sites, never a general escape hatch. Two guards need it — the client's and
+#: the endpoint's, both refusing to publish a different member — and
+#: `app/errors.py` defines and validates it. A third file appearing here means
+#: the taxonomy is being renegotiated one call site at a time.
+RETRYABLE_OVERRIDE_SITES = {
+    "app/errors.py",
+    "app/linkedin/client.py",
+    "app/api/v1/profile.py",
+}
+
+
+def test_the_retryable_override_is_only_used_where_it_was_argued_for() -> None:
+    overriding = {
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in sorted((REPO_ROOT / "app").rglob("*.py"))
+        if "retryable=" in path.read_text(encoding="utf-8")
+    }
+
+    unexpected = sorted(overriding - RETRYABLE_OVERRIDE_SITES)
+    assert not unexpected, (
+        f"{unexpected} set `retryable` per raise site. The override exists for "
+        "the two member-mismatch guards and is not a general way to disagree "
+        "with response-schema.md — argue the case, then add the file here."
+    )
+
+
+# --- The authentication boundary covers paths that do not exist ---------------
+
+
+UNMATCHED_PATH = "/api/v1/__no_such_route__"
+
+
+@pytest.mark.parametrize("method", ["GET", "POST", "PUT", "PATCH", "DELETE"])
+def test_an_unmatched_v1_path_without_a_token_is_401_not_404(
+    client: TestClient, method: str
+) -> None:
+    """The story's matrix row, and it is about enumeration rather than data.
+
+    Routing runs before dependencies, so a path with no route never reached
+    `require_claims` at all and answered 404 while a real path answered 401.
+    Nothing leaks that way — but the difference between the two answers is a
+    map of this API's surface, readable from the status code by somebody who
+    has not authenticated. Observed on the deployed host.
+    """
+    assert_unauthenticated(client.request(method, UNMATCHED_PATH))
+
+
+def test_a_real_route_and_an_absent_one_are_indistinguishable_without_a_token(
+    client: TestClient,
+) -> None:
+    """The property, stated directly: same status, same body, same headers.
+
+    Asserting the two responses are equal is what makes this a test of
+    indistinguishability rather than of one status code.
+    """
+    absent = client.get(UNMATCHED_PATH)
+    real = client.get(PROBE_PATH)
+
+    assert absent.status_code == real.status_code == 401
+    assert absent.json() == real.json()
+    assert absent.headers["www-authenticate"] == real.headers["www-authenticate"]
+
+
+def test_a_bad_token_on_an_unmatched_path_is_refused_the_same_way(
+    client: TestClient,
+) -> None:
+    """Inherited validation, not a presence check — the catch-all is a real route."""
+    assert_unauthenticated(
+        client.get(UNMATCHED_PATH, headers=bearer(make_token(key=_FOREIGN_KEY)))
+    )
+
+
+def test_an_authenticated_caller_still_gets_a_real_404(client: TestClient) -> None:
+    """The other half of the requirement: real 404s must survive.
+
+    An authenticated caller has proved they may know the shape of this API, and
+    telling them a path does not exist is the honest answer. Turning every 404
+    under `/api/v1` into a 401 would break `PROFILE_NOT_FOUND`, which is a real
+    404 from a real route.
+    """
+    _assert_envelope(
+        client.get(UNMATCHED_PATH, headers=bearer(make_token())), 404, retryable=False
+    )
+
+
+def test_a_wrong_method_on_a_real_route_survives_the_catch_all(
+    client: TestClient,
+) -> None:
+    """The cost of matching everything, bought back deliberately.
+
+    A catch-all claiming every method turns `POST /api/v1/profile` into an
+    ordinary full match, so Starlette never produces the 405 and `Allow` a
+    client needs. `_methods_answering` asks the routing table the same question
+    directly, and this is what says it answers correctly.
+    """
+    response = client.post(PROBE_PATH, headers=bearer(make_token()))
+
+    _assert_envelope(response, 405, retryable=False)
+    assert "GET" in response.headers["allow"]
+
+
+def test_a_path_outside_the_versioned_seam_is_untouched(client: TestClient) -> None:
+    """`/health` is open by construction and unknown paths outside `/api/v1`
+    are still an ordinary 404 — the guard is scoped to the prefix it protects."""
+    _assert_envelope(client.get("/no/such/path"), 404, retryable=False)
+    assert client.get("/health").status_code == 200
+
+
+def test_the_catch_all_is_the_last_route_or_it_shadows_the_real_ones() -> None:
+    """First match wins, so a route registered after this one is unreachable.
+
+    The symptom of getting that wrong is every request to a newly added
+    endpoint answering 404, which points nowhere near the cause — so the
+    ordering is asserted rather than left to the comment beside it.
+    """
+    routes = create_app().router.routes
+
+    assert getattr(routes[-1], "path", None) == v1.UNMATCHED_PATH_ROUTE
+    assert [
+        route for route in routes if getattr(route, "path", None) == v1.UNMATCHED_PATH_ROUTE
+    ] == [routes[-1]], "exactly one route may declare the catch-all path"
+
+
+def test_the_catch_all_is_not_published_as_api_surface(client: TestClient) -> None:
+    """It documents nothing callable, and would read as a real endpoint."""
+    paths = client.get("/openapi.json").json()["paths"]
+
+    assert v1.UNMATCHED_PATH_ROUTE not in paths
+    assert not any("unmatched" in path for path in paths)
+
+
+def test_the_catch_all_claims_every_method_a_prober_could_use() -> None:
+    """A method left out is the hole moving rather than closing."""
+    assert set(v1.UNMATCHED_PATH_METHODS) >= {
+        "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS",
+    }
 
 
 def test_the_error_handler_refuses_a_type_it_cannot_render() -> None:

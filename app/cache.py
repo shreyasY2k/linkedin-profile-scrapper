@@ -17,27 +17,43 @@ THE RULE IS ONE LINE, AND ITS INPUT ALREADY EXISTS
 
 *Fall back only when the failure is retryable and a usable record exists.*
 
-``retryable`` is read off :data:`~app.errors.ERROR_SPECS` — the table
-transcribed from ``response-schema.md`` — rather than being a second list of
-codes kept here. A second list is a thing that drifts: story 8 owns the
-taxonomy, and if it reclassifies a code, this module has to follow it without
-being edited. :meth:`ProfileCache.fallback_for` is the **only** public way to
-read this cache, so that gate cannot be walked around by calling something else.
+``retryable`` is read off the *error being answered* —
+:attr:`app.errors.ApiError.retryable` — rather than being a second list of codes
+kept here. A second list is a thing that drifts: story 8 owns the taxonomy, and
+if it reclassifies a code, this module has to follow it without being edited.
+:meth:`ProfileCache.fallback_for` is the **only** public way to read this cache,
+so that gate cannot be walked around by calling something else.
+
+**The value read is the effective one, not the code's default.** Story 8 made
+``retryable`` a per-response property: ``ERROR_SPECS`` still fixes the default
+for every code, and a raise site may narrow it — a response naming a different
+member is an ``UPSTREAM_ERROR`` that is *not* retryable. Reading the code's
+default off ``error.spec`` here would change the body while still serving the
+record, which is worse than not overriding at all: the caller would be told the
+failure is permanent and handed a cached 200 anyway. ``tests/test_cache.py``
+greps this whole package for that mistake.
 
 The consequence is what makes this safe. ``NO_SESSION``, ``SESSION_EXPIRED``,
 ``UNAUTHENTICATED``, ``INVALID_URL`` and ``PROFILE_NOT_FOUND`` are all
-``retryable: false``, so **none of them can ever be answered from this cache**.
-Hiding an expired session behind cached data is the precise failure this project
-has already had to fix once: the caller would be told their profile request
-succeeded, forever, while their credential was dead and nothing in the response
-said so.
+``retryable: false``, so **none of them can ever be answered from this cache**;
+and so is the member-mismatch ``UPSTREAM_ERROR``, by the same one line, because
+that guard now narrows its own instance. Hiding an expired session behind cached
+data is the precise failure this project has already had to fix once: the caller
+would be told their profile request succeeded, forever, while their credential
+was dead and nothing in the response said so. Republishing an old identity
+mapping for a vanity URL that has changed hands is the same failure wearing a
+different code.
 
 (One honest qualification, verified live and recorded in the story's change log:
 LinkedIn does not always *state* that refusal. A dead cookie whose authwall
 arrives as a 200 redirect is classified ``UPSTREAM_CHALLENGE`` — retryable — and
 is stale-served like any other challenge, because that page is indistinguishable
-from the one a datacenter IP draws with a perfectly good session. The gate below
-is exact; what feeds it is not.)
+from the one a datacenter IP draws with a perfectly good session. Story 8
+narrowed that gap as far as the evidence allows: the same page served by the
+``me`` resource, which describes the session's own *owner*, is now
+``SESSION_EXPIRED`` and reaches the caller. On a profile fetch the ambiguity is
+real and the challenge classification stands. The gate below is exact; what
+feeds it is not.)
 
 ===============================================================================
 UNBOUNDED, BY DECISION — AND WHAT THAT OBLIGES
@@ -259,18 +275,20 @@ class ProfileCache:
         entry point is a second place for the gate to be forgotten, which is how
         a cached profile eventually reaches a caller whose session has died.
 
-        ``error.spec.retryable`` is the table in ``response-schema.md``, read
-        rather than re-stated. A code this API considers permanent —
-        ``SESSION_EXPIRED`` and ``NO_SESSION`` above all — reaches the caller as
-        itself no matter how good the cached record is, because a caller whose
-        credential has died needs to be told so, and a 200 with someone's
-        profile in it does not tell them.
+        ``error.retryable`` is the table in ``response-schema.md``, read rather
+        than re-stated — and it is the **effective** value, so a raise site that
+        narrowed it is honoured here rather than being overruled by its code's
+        default. A failure this API considers permanent — ``SESSION_EXPIRED``
+        and ``NO_SESSION`` above all — reaches the caller as itself no matter
+        how good the cached record is, because a caller whose credential has
+        died needs to be told so, and a 200 with someone's profile in it does
+        not tell them.
 
         **This never raises**, for the reason in the module docstring: a cache
         read that throws must not turn the caller's real upstream error into a
         503 about this service's own datastore.
         """
-        if not error.spec.retryable:
+        if not error.retryable:
             # Not logged: this is the ordinary path for every permanent failure,
             # and a line here would put one per 404 in the log for no reader.
             return Fallback(NOT_RETRYABLE)

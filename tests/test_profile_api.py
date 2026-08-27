@@ -1081,6 +1081,74 @@ def test_a_different_member_is_still_a_502_when_a_record_exists(
     assert "Ada Placeholder" not in response.text, "no stale body may leak out here"
 
 
+def test_a_different_member_is_reported_as_a_permanent_failure(
+    client: TestClient, vault: SessionVault, fetch: RecordingFetch
+) -> None:
+    """`retryable: false` on the wire, which is what a client actually branches on.
+
+    A deliberate deviation from `response-schema.md`, made with the author: the
+    table marks `UPSTREAM_ERROR` retryable and this one is not, because the
+    condition is permanent and a retry cannot change it. The published table has
+    one row per code; the wire has one flag per response, and the flag is
+    authoritative.
+    """
+    store_session(vault, SUBJECT_A)
+    fetch.result = raw_profile(public_id="someone-else")
+
+    body = get(client).json()
+
+    assert body["error"]["code"] == "UPSTREAM_ERROR"
+    assert body["error"]["retryable"] is False
+    assert set(body["error"]) == {"code", "message", "retryable"}
+
+
+def test_the_mismatch_is_refused_by_the_taxonomy_and_not_only_by_its_placement(
+    client: TestClient, vault: SessionVault, fetch: RecordingFetch
+) -> None:
+    """The client-side guard's refusal, which arrives from INSIDE the boundary.
+
+    Story 7 could only move the endpoint's own guard outside the stale-serve
+    `try`. The client raises its twin during the fetch, so that one lands in the
+    `except ApiError` and is offered to the cache like any other failure — and
+    with a record present it used to come back as a 200. What refuses it now is
+    the narrowed flag, and this is the row that shows it: same code, record in
+    the cache, still a 502.
+
+    `tests/test_linkedin_client.py::test_the_member_mismatch_refusal_is_not_retryable`
+    pins that the real client raises exactly this; here it is the route's half.
+    """
+    store_session(vault, SUBJECT_A)
+    get(client)  # a good record now exists for the requested id
+    fetch.raises = ApiError(
+        "UPSTREAM_ERROR",
+        retryable=False,
+        cause="member-mismatch",
+        log_detail="core response named a different member",
+    )
+
+    response = get(client)
+
+    assert response.status_code == 502, response.text
+    assert response.json()["error"]["retryable"] is False
+    assert "Ada Placeholder" not in response.text, "no stale body may leak out here"
+
+
+def test_the_cause_is_operator_only_and_never_reaches_the_caller(
+    client: TestClient, vault: SessionVault, fetch: RecordingFetch
+) -> None:
+    """`cause` names an internal classification branch. It joins `log_detail`."""
+    store_session(vault, SUBJECT_A)
+    fetch.raises = ApiError(
+        "UPSTREAM_ERROR", cause="malformed-body", log_detail="internal reason"
+    )
+
+    response = get(client)
+
+    assert set(response.json()["error"]) == {"code", "message", "retryable"}
+    assert "malformed-body" not in response.text
+    assert "internal reason" not in response.text
+
+
 def test_a_different_member_still_records_that_the_session_worked(
     client: TestClient, vault: SessionVault, fetch: RecordingFetch
 ) -> None:

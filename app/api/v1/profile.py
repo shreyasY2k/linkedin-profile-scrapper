@@ -92,6 +92,7 @@ from app.cache import DATASTORE_UNAVAILABLE, UNUSABLE_RECORD, Fallback, ProfileC
 from app.cache import cache as _process_cache
 from app.errors import NO_STORE, ApiError, ErrorEnvelope, error_responses
 from app.linkedin.client import (
+    CAUSE_MEMBER_MISMATCH,
     DEFAULT_TIMEOUT_SECONDS,
     RawProfile,
     VoyagerClient,
@@ -366,6 +367,19 @@ PROFILE_ERRORS: dict[int | str, dict[str, Any]] = {
     },
 }
 
+# The 502's meaning changed with story 8 and the generated description cannot
+# say so on its own: `error_responses` builds it from `ERROR_SPECS`, which
+# carries one message and one `retryable` per code, and this status now covers a
+# case that contradicts the published table. Appended rather than replaced, so
+# the codes and their own messages still come from the taxonomy.
+PROFILE_ERRORS[502]["description"] += (
+    " **Read `retryable` from the body, not from the table.** A response that "
+    "names a different member than the URL asked for is `UPSTREAM_ERROR` with "
+    "`retryable: false`: it is a permanent condition — a vanity URL that now "
+    "belongs to someone else — and it is never softened into a stale 200, "
+    "whatever is cached. Every other `UPSTREAM_ERROR` here is retryable."
+)
+
 
 def _isoformat(moment: datetime) -> str:
     """RFC 3339 in UTC with a ``Z``, at second precision.
@@ -497,15 +511,19 @@ async def _cache_remember(
         "A failure this API *classifies* as permanent is never masked this way: "
         "`SESSION_EXPIRED`, `NO_SESSION`, `INVALID_URL` and "
         "`PROFILE_NOT_FOUND` reach you as themselves whatever is cached, and so "
-        "does a response that names a different member than you asked for.\n\n"
+        "does a response that names a different member than you asked for — "
+        "that one is a `502 UPSTREAM_ERROR` carrying `retryable: false`, which "
+        "is the flag to branch on rather than the code.\n\n"
         "**One known gap in that promise.** LinkedIn does not always state a "
         "refusal as a refusal: a dead `li_at` is sometimes answered with a "
         "redirect to an authwall carrying a `200`, which is indistinguishable "
         "from the challenge page a datacenter IP draws with a perfectly good "
-        "session. That classifies as `UPSTREAM_CHALLENGE` — retryable — so it "
-        "*is* stale-served. If `stale` has been `true` for longer than you can "
-        "explain, re-`PUT` your session before assuming LinkedIn is the "
-        "problem."
+        "session. On a profile fetch that classifies as `UPSTREAM_CHALLENGE` — "
+        "retryable — so it *is* stale-served. If `stale` has been `true` for "
+        "longer than you can explain, re-`PUT` your session before assuming "
+        "LinkedIn is the problem: that check asks LinkedIn who owns the cookie, "
+        "where the same wall *is* read as a dead session, and it answers "
+        "`last_use_ok: false` immediately."
     ),
 )
 async def get_profile(
@@ -632,10 +650,14 @@ async def get_profile(
 
     # 4. The answer must be about the profile that was ASKED for.
     #
-    #    **Outside the stale-serve boundary, deliberately.** This raises
-    #    UPSTREAM_ERROR, which `ERROR_SPECS` marks retryable, so inside the
-    #    boundary it would be answered 200-stale whenever a record existed. The
-    #    decision, made here rather than deferred: it stays a 502.
+    #    **Outside the stale-serve boundary, and non-retryable.** Story 7 could
+    #    only do the first half: `UPSTREAM_ERROR` is retryable in `ERROR_SPECS`,
+    #    so inside the boundary this would be answered 200-stale whenever a
+    #    record existed, and the placement was the only thing preventing that.
+    #    Story 8 owns the taxonomy and narrows this raise to `retryable: false`,
+    #    which is what actually makes the refusal permanent — the cache gate now
+    #    declines it on its own. The placement stays as belt to that braces:
+    #    two independent mechanisms, and removing either one still leaves a 502.
     #
     #    A response naming a different member is a *permanent* condition — a
     #    vanity URL that now belongs to somebody else, a redirect, a
@@ -644,10 +666,7 @@ async def get_profile(
     #    for ever and never once tell the caller that the URL they are asking
     #    about has stopped meaning what they think. That is the same shape as
     #    hiding a dead session behind cached data, which the spec forbids
-    #    outright; the only reason it is not literally that rule is that the
-    #    code is misclassified, and story 8 owns fixing the code. Placing the
-    #    raise here makes the behaviour correct *regardless* of what story 8
-    #    decides, without this story editing a taxonomy it does not own.
+    #    outright.
     #
     #    `raw.public_id` is what the rest of this handler builds `url` and
     #    `public_id` from, so without this check a redirect, an upstream
@@ -665,6 +684,13 @@ async def get_profile(
         )
         raise ApiError(
             "UPSTREAM_ERROR",
+            # The one deliberate deviation from the published table, and it is
+            # the wire value that is authoritative: `response-schema.md` marks
+            # UPSTREAM_ERROR retryable, and this instance is not. Adding a
+            # taxonomy row was the declined alternative — a caller reads
+            # `retryable` precisely so they need not read prose.
+            retryable=False,
+            cause=CAUSE_MEMBER_MISMATCH,
             log_detail="the fetch answered with a different public id than requested",
         )
 
