@@ -149,3 +149,11 @@
   summary: `LINKEDIN_DEV_COOKIE` is blanked for the api container in compose, but nothing stops a future service definition from re-inheriting it through `env_file`.
   evidence: A test asserts the api service carries the blanking override. Any new container that mounts `.env` wholesale needs the same line, and nothing enforces that for a service that does not exist yet.
 
+
+- source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
+  summary: The publicIdentifier mismatch guard raises UPSTREAM_ERROR, which is retryable, for a condition that is permanent.
+  evidence: fetch_profile refuses when the core response names a different member than the URL asked for - correct, since answering with the wrong person is the worst possible failure and story 7 would cache it. But retryable=true means story 7 stale-serves the refusal indefinitely, the same trap as the expired-session misclassification. It should carry a non-retryable code. Story 8 owns the taxonomy and should reclassify it.
+
+- source_spec: `_bmad-output/specs/spec-linkedin-profile-scraper/stories/4-voyager-client-raw-profile-json.md`
+  summary: A profile whose LinkedIn vanity URL has changed would be refused, because the guard compares the requested public id against the returned publicIdentifier by exact equality.
+  evidence: Untested - it is unknown whether Voyager's memberIdentity query resolves an old vanity name to the current profile. If it does, a legitimate old URL becomes a hard failure. Accepted deliberately: refusing is recoverable by the caller, answering with the wrong person is not. Worth probing live before submission, since an evaluator may use a URL whose vanity name changed.

@@ -141,3 +141,25 @@
     the two evaluator curl commands verbatim and verify them against the
     deployed URL from a machine that has never authenticated. Audit the
     full git history for secrets, not just the working tree.
+
+- id: "10"
+  title: Introduce schema migrations over the settled schema
+  description: >-
+    Replace the idempotent startup bootstraps from stories 5-8 with a real
+    migration tool, once the API surface is complete and the schema has stopped
+    changing. Not a SPEC capability - this is engineering debt repaid
+    deliberately rather than a graded deliverable.
+  invoke_dev_with: >-
+    Run this only after story 8, when the schema has settled - introducing
+    migrations while stories 6-8 are still adding tables would mean rewriting
+    the migration history as fast as it is written. Baseline the FIRST
+    migration against the schema those bootstraps already produce, so an
+    existing deployed database and a cold volume converge on the same state:
+    a fresh database must migrate up from nothing, and the running instance
+    must stamp as already-at-head without re-creating what it has. Keep the
+    bootstraps working until the migration path is proven on a copy of the
+    deployed data, then delete them in the same commit that proves it.
+    Keycloak owns the public schema and manages its own tables - the migration
+    tool must be scoped to the application schema only and must never see
+    Keycloak's. This is below the Must tier: if the deadline is at risk, this
+    is the first thing cut, and the bootstraps ship as they are.
