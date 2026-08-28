@@ -80,7 +80,7 @@ cat <<'NEXT'
 OK: port 22 is still accepted, and 80/443 are now accepted above the REJECT.
 
 NOT YET PERSISTED — this is on purpose.
-  1. From the dev machine, open a SECOND ssh session:  ssh oci-docker
+  1. From the dev machine, open a SECOND ssh session to this host
   2. Only once that connects, persist on the instance:  sudo netfilter-persistent save
 
 If step 1 fails, do not persist: reboot the instance from the OCI console and

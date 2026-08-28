@@ -85,10 +85,21 @@ longer than you can explain, re-`PUT` your session.**
 
 The converse is evidenced in one direction only. Nothing establishes that
 LinkedIn never walls `me` for a *healthy* session from a datacenter IP; if it
-does, `PUT` reports `last_use_ok: false` about a credential that works. The
-blast radius is bounded — `me` is reached only by the `PUT` verification, never
-by the profile route — so a wrong verdict costs a misleading bookkeeping field
-rather than a failed fetch.
+does, `PUT` reports `last_use_ok: false` about a credential that works.
+
+**The blast radius of that grew, and it is worth stating.** It used to be
+bounded to bookkeeping, because `me` was reached only by the `PUT`
+verification. Since commit `33b4fad` the profile route reaches it too: a 403 on
+a profile resource that is not delivered as a wall probes `me` once
+(`_reconsider_refusal` → `_probe_session` → `check_session`) to decide whether
+the refusal is about the member or about the cookie. A healthy `me` turns the
+403 into `404 PROFILE_NOT_FOUND`; a dead or walled `me` leaves it
+`428 SESSION_EXPIRED`; an inconclusive probe changes nothing. So a wrong verdict
+on `me` now costs a **wrong error on a real fetch** — a working session reported
+as expired on a profile that merely does not exist — rather than only a
+misleading field on the session endpoint. The probe is memoized per request, so
+it costs at most one extra call, and the default on every inconclusive answer is
+still "leave the standing verdict alone".
 
 ## The cache is keyed by profile; LinkedIn's retrieval is viewer-relative
 
@@ -122,10 +133,15 @@ record.
 ## The cache grows without bound and nothing can remove one record
 
 No TTL, no eviction, no delete endpoint — `ProfileCacheStore` deliberately
-exposes no delete so it cannot be reintroduced by accident. The table grows by
-roughly 7 KB per distinct profile ever fetched. **The only way to drop a record
-is `docker compose down -v`, which also destroys the Keycloak realm and every
-stored session.**
+exposes no delete so it cannot be reintroduced by accident. How fast the table
+grows depends entirely on how much the member has published: three real records
+measured live spanned roughly **2 KB to 20 KB** each, so a per-profile figure is
+a range rather than a number.
+
+**Nothing in the application ever removes a record**, so every way to drop one
+is outside it: `docker compose down -v`, which also destroys the Keycloak realm
+and every stored session, or a `DELETE` you run yourself in `psql` against
+`app.profile_cache`. There is no supported path, only those two.
 
 Two consequences worth naming: there is no way to honour a deletion request for
 a cached profile short of dropping everything, and a profile whose owner has
@@ -223,7 +239,8 @@ A deliberate, approved deviation from a published contract, called out because a
 client that trusts the table will get this wrong.
 
 `retryable` is a property of the **response**, not of the code.
-`response-schema.md` marks `UPSTREAM_ERROR` retryable — and it is, everywhere
+[`response-schema.md`](../_bmad-output/specs/spec-linkedin-profile-scraper/response-schema.md)
+marks `UPSTREAM_ERROR` retryable — and it is, everywhere
 except one case: a fetch that comes back naming a **different member** than the
 URL asked for returns `502 UPSTREAM_ERROR` with `"retryable": false`, because
 that condition is permanent and repeating the request cannot change it. The wire
@@ -239,8 +256,12 @@ service claims**, and two things leak:
 - `/openapi.json` is unauthenticated and publishes every route, by design,
   because it is this API's documentation.
 - FastAPI reads and parses a request body *before* route dependencies run, so
-  `PUT /api/v1/session` with malformed bytes returns `400` while the same
-  malformed request to a non-existent path returns `401`.
+  `PUT /api/v1/session` with a malformed body answers about the body while the
+  same malformed request to a non-existent path returns `401`. Verified against
+  the deployed service, with no token presented: a body that is not valid JSON
+  returns **`422 INVALID_REQUEST`**, and bytes that will not decode at all
+  return `400 BAD_REQUEST` from FastAPI's own body-read guard. Either way the
+  existing route answers something other than `401`, which is the leak.
 
 Closing the second means moving authentication into middleware ahead of body
 parsing — a larger change than the leak justifies given the first. Accepted, and
@@ -266,9 +287,15 @@ treats every field as optional for exactly this reason, but "degrades into
 
 Measured, and worth knowing: `profileLanguages` returned **0 elements** on one
 call and **3** on an identical call minutes later, HTTP 200 both times. A
-zero-length section is therefore not evidence that the member lacks that data,
-which is why empty sections can land in `partial[]` rather than being published
-as `[]`.
+zero-length section is therefore not evidence *on its own* that the member lacks
+that data — which is why the mapper reads LinkedIn's own stated `paging.total`
+alongside the element count rather than trusting the count by itself. A section
+that answers `{"elements": [], "paging": {"total": 0}}` has stated it is empty,
+and since commit `258939b` it is published as `[]` with nothing in `partial[]`;
+a section whose stated total exceeds what came back, or that records no count at
+all, is the one that goes to `partial[]`. Verified live: `satyanadella` returns
+`"skills": []`, `"certifications": []` and `"languages": []` with
+`"partial": []`.
 
 ## Sections beyond 100 entries are reported, not retrieved
 

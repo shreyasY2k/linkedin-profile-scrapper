@@ -15,7 +15,7 @@ flowchart LR
         LB["OCI Load Balancer<br/>terminates TLS · holds the certificate"]
     end
 
-    subgraph Host["Oracle A1 Flex · Ubuntu 24.04 · arm64 · 10.0.1.173/24 (private, no public IP)"]
+    subgraph Host["Oracle A1 Flex · Ubuntu 24.04 · arm64 · private VCN subnet, no public IP"]
         NGX["host nginx 1.24<br/>port 80 only · no certificate"]
 
         subgraph DC["docker compose — one command"]
@@ -81,6 +81,8 @@ sequenceDiagram
 
 Step 8 is the load-bearing one: **a profile costs six upstream calls, not one.** The core entity carries only `experienceCardUrn` and `educationCardUrn` pointers, so each section is its own request. That multiplies rate-limit exposure sixfold per API call and is the strongest argument for stale-serve.
 
+Six is the normal case rather than an invariant. Two documented paths add a seventh, neither of them a retry of a failure: a core request whose decoration LinkedIn refuses is repeated once without it (the profile then carries no `region`), and a `403` from a profile resource that is not delivered as a wall spends one memoized call on `me` to decide whether the refusal is about the member or about the cookie.
+
 ## Retrieval fan-out
 
 ```mermaid
@@ -109,21 +111,24 @@ A section failing degrades rather than aborts: it is omitted from the payload an
 
 ## Absent versus unreadable
 
-The distinction `response-schema.md` calls load-bearing, and the easiest thing in this system to get quietly wrong.
+The distinction [`response-schema.md`](../_bmad-output/specs/spec-linkedin-profile-scraper/response-schema.md) calls load-bearing, and the easiest thing in this system to get quietly wrong.
 
 ```mermaid
 flowchart TD
     Q{"section request"}
-    Q -->|"HTTP error"| U["unreadable<br/>omit key · add to partial[]"]
+    Q -->|"HTTP error, or no payload"| U["unreadable<br/>omit key · add to partial[]"]
+    Q -->|"200, no element count recorded"| U
+    Q -->|"200, stated total exceeds what came back"| U
     Q -->|"200, elements present"| V["map normally"]
-    Q -->|"200, zero elements"| AMB{"genuinely empty?"}
-    AMB -->|"cannot be distinguished"| U
+    Q -->|"200, zero elements and a stated total of 0"| E["genuinely empty<br/>publish [] · nothing in partial[]"]
 
-    classDef warn fill:#3a2f14,stroke:#b8860b,color:#f5deb3
-    class AMB warn
+    classDef good fill:#14321f,stroke:#3a8f5a,color:#c9f0d6
+    class E good
 ```
 
-Measured: `profileLanguages` returned **0 elements** on one call and **3** on an identical call minutes later — HTTP 200, no error, both times. So a zero-length section is *not* evidence the profile lacks that data. Mapping empty → `[]` would publish "this person speaks no languages" as fact. It belongs in `partial[]`.
+The decision is made from **several facts, not one signal** — `app/mapping/profile.py:31-45` is the table it implements. "Zero elements came back" on its own is not evidence of an empty section: measured, `profileLanguages` returned **0 elements** on one call and **3** on an identical call minutes later, HTTP 200 both times. But LinkedIn states its own `paging.total`, and a section that answers `{"elements": [], "paging": {"total": 0}}` has *said* it is empty rather than merely looked it. That is a result, and it is published as `[]` with nothing in `partial[]`.
+
+Commit `258939b` is where this changed. Before it, a genuinely empty section was read as a malformed envelope, so skills, certifications and languages landed in `partial[]` on most real profiles — the service reporting it could not read three of the ten required fields that LinkedIn had answered perfectly. Verified live: `satyanadella` returns `"skills": []`, `"certifications": []` and `"languages": []` with `"partial": []`.
 
 ## Authentication boundary
 
@@ -156,7 +161,7 @@ Auth attaches to the **router**, not to individual routes, so a later route inhe
 | 1 | Skeleton, env config, local parity | Done |
 | 2 | Deploy through LB and nginx | **Done** — live at https://shreyaskaushik.dpdns.org |
 | 3 | Keycloak realm, clients, JWT validation | Done |
-| 4 | Voyager client, raw JSON | Done — six calls per fetch, `count=100` sections, truncation reported rather than hidden |
+| 4 | Voyager client, raw JSON | Done — six calls per fetch in the normal case, `count=100` sections, truncation reported rather than hidden |
 | 5 | Encrypted per-user session vault | Done — `PUT`/`GET /api/v1/session`, Fernet at rest, keyed on `sub` |
 | 6 | Profile extraction and schema mapping | Done — the graded core; `partial[]` carries absent-versus-unreadable |
 | 7 | Response cache with stale-serve | Done — Postgres-backed, unbounded, retryable failures only |

@@ -65,11 +65,17 @@ and there is no Playwright, Selenium or Chromium anywhere in this repository** �
 `requirements.txt` is seven packages and none of them renders a page. Saying so
 plainly is better than leaving a reader to infer a fallback that does not exist.
 
-One fetch is **six** calls: one for the core profile, then five concurrent
-section calls (experience, education, skills, certifications, languages). There
-is no retry, because the failures worth retrying are the ones an immediate retry
-makes worse. Sections are requested with `count=100` rather than the default 20
-— found the hard way, when a profile with 33 skills returned 20 of them with a
+One fetch is **six** calls in the normal case: one for the core profile, then
+five concurrent section calls (experience, education, skills, certifications,
+languages). There is no retry, because the failures worth retrying are the ones
+an immediate retry makes worse. Two documented paths can add a seventh, and
+neither is a retry of a failure: a core request whose decoration LinkedIn
+refuses is repeated once without it (the profile then carries no `region`), and
+a `403` from a profile resource that is not a wall spends one memoized call on
+`me` to decide whether the refusal is about the member or about the cookie.
+
+Sections are requested with `count=100` rather than the default 20 — found the
+hard way, when a profile with 33 skills returned 20 of them with a
 `200` and no error. Beyond 100 the shortfall is **reported** rather than
 silently truncated: the section is omitted and named in `partial`.
 
@@ -89,11 +95,25 @@ last good record is returned instead, with `stale: true` and the original
 Three properties make that honest rather than a lie of convenience:
 
 1. **Only retryable failures fall back.** A permanent failure reaches you as
-   itself, however good the cached copy is. A dead session is `428`, not a
-   comfortable `200`.
+   itself, however good the cached copy is. A dead session that LinkedIn
+   *states* as a refusal is `428`, not a comfortable `200`.
+
+   **The qualifier is load-bearing and the gap is real.** LinkedIn does not
+   always state a refusal as a refusal: a dead `li_at` is often answered with an
+   authwall carrying a `200`, which is the same page a datacenter IP draws with
+   a perfectly healthy session. On a profile fetch the two are
+   indistinguishable, so both classify as `502 UPSTREAM_CHALLENGE` — which is
+   retryable — and that kind of dead session **is** stale-served, indefinitely.
+   So the honest form of the property is "only retryable failures fall back",
+   not "a dead session always reaches you as a 428". `PUT /api/v1/session`
+   narrows it by verifying against `me`, where a wall *is* evidence about the
+   cookie, but it does not close it. Full treatment under
+   [Known limitations](limitations.md#a-dead-cookie-can-be-reported-as-staleness-rather-than-expiry).
+
 2. **The record is served exactly as stored.** Same `profile`, same `partial`,
    same omitted keys — nothing is re-derived on the way out, so "this was true
    once, at this timestamp" is a checkable claim.
+
 3. **It is unbounded, and that is the trade.** No TTL, no eviction, no delete
    endpoint. An answer you can date and judge beats an error page. `fetched_at`
    is what makes it actionable, and refusing any response with `stale: true` is
@@ -184,11 +204,12 @@ tests/
                      NOT be answered from the cache, plus a resolver that checks
                      every cache statement against the schema bootstrap creates
                      (the cache is the one thing here that can break silently)
-  test_postgres_live.py  the opt-in database round-trip; skipped by default
+  test_postgres_live.py  the opt-in database round-trip; 16 tests, skipped by
+                     default — the larger half of the 17 skips
   test_profile_api.py  GET /api/v1/profile end to end, stubbed client
   support.py         shared test helpers — the single seam between test modules
   test_linkedin_client.py  the retrieval edge-case matrix, entirely offline
-  test_linkedin_live.py    the one opt-in live check; skipped by default
+  test_linkedin_live.py    the single opt-in LinkedIn check; the 17th skip
   fixtures/          synthetic Voyager payloads — invented people, .invalid
                      hosts, no captured data (a test enforces this)
 .gitleaks.toml       secret-scan config: the default rules, plus three
@@ -204,6 +225,10 @@ deploy/
 docs/
   architecture.md    diagrams: topology, request flow, retrieval fan-out,
                      the auth boundary, and the decision log
+_bmad-output/        the planning trail this was built from — brief, SPEC, the
+                     nine story files, and `specs/spec-linkedin-profile-scraper/
+                     response-schema.md`, the wire contract the mapper and the
+                     error taxonomy are both written against
 Dockerfile           slim python base, non-root, deps layer before source
 docker-compose.yml   api + keycloak + postgres, healthchecked, loopback-only
 .env.example         the env contract

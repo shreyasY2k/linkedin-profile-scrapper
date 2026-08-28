@@ -647,15 +647,34 @@ def test_a_dead_session_aborts_the_whole_fetch_rather_than_degrading(
 @pytest.mark.parametrize(
     "code,status",
     [
+        ("SESSION_EXPIRED", 428),
         ("PROFILE_NOT_FOUND", 404),
         ("RATE_LIMITED", 429),
         ("UPSTREAM_CHALLENGE", 502),
         ("UPSTREAM_ERROR", 502),
     ],
 )
-def test_every_upstream_failure_wears_its_documented_status(
+def test_every_code_the_fetch_can_raise_wears_its_documented_status(
     client: TestClient, vault: SessionVault, fetch: RecordingFetch, code: str, status: int
 ) -> None:
+    """The five taxonomy codes reachable by raising from the fetch, not all eight.
+
+    The name is scoped deliberately. ``response-schema.md``'s taxonomy has eight
+    codes and three of them cannot be driven through this harness, because they
+    are decided **before** any fetch happens and driving them from
+    ``fetch.raises`` would assert a path that does not exist:
+
+    * ``UNAUTHENTICATED`` — ``require_claims`` on the router rejects the request
+      before the route body runs. ``tests/test_auth.py`` owns the whole matrix.
+    * ``INVALID_URL`` — raised by URL parsing before a session is even loaded.
+    * ``NO_SESSION`` — raised by the route itself when the vault is empty, which
+      is exactly what ``test_no_stored_session_is_428_before_any_upstream_call``
+      asserts, including that no upstream call is made.
+
+    ``SESSION_EXPIRED`` **is** reachable here and belongs in the list;
+    ``test_a_dead_session_aborts_the_whole_fetch_rather_than_degrading`` covers
+    the same code with the extra ``last_use_ok`` bookkeeping assertion.
+    """
     store_session(vault, SUBJECT_A)
     fetch.raises = ApiError(code, log_detail="test")
 

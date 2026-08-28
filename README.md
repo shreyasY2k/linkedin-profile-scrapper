@@ -77,8 +77,9 @@ failure modes under [Known limitations](#known-limitations).
 The two commands above ride on a pre-seeded session. The model this service was
 actually built on is **bring your own**: you upload your own `li_at` once, it is
 encrypted at rest and bound to your token's subject, and every profile request
-you make runs under it. One `PUT` switches the evaluator lane over to your
-cookie:
+you make runs under it. One `PUT` switches a lane over to your cookie —
+**locally.** Against the deployed host that lane is the graded one and the
+overwrite is irreversible, so read the box under the command before you run it:
 ```bash
 TOKEN=$(curl -fsS -X POST \
   -d grant_type=client_credentials \
@@ -91,7 +92,7 @@ TOKEN=$(curl -fsS -X POST \
 read -rs -p 'Paste your li_at: ' LI_AT; echo   # -s: not echoed, not in history
 
 LI_AT="$LI_AT" python3 -c 'import json,os;print(json.dumps({"li_at":os.environ["LI_AT"]}))' \
-  | curl -fsS -X PUT \
+  | curl -sS -X PUT \
       -H "Authorization: Bearer $TOKEN" \
       -H 'content-type: application/json' \
       --data-binary @- \
@@ -101,12 +102,27 @@ LI_AT="$LI_AT" python3 -c 'import json,os;print(json.dumps({"li_at":os.environ["
 unset LI_AT
 ```
 
-`PUT` **overwrites** — it replaces whatever session is stored for your subject,
-including the pre-seeded one, and there is no undo and no delete endpoint. To
-leave the graded lane undisturbed, mint with `linkedin-profile-api-second`
-instead (see
-[Prove the isolation](docs/usage.md#prove-the-isolation-two-callers-two-sessions));
-it is a different service account and therefore a different vault row.
+> ### Read this before running the `PUT` above
+>
+> **`PUT` overwrites, and against the deployed host it overwrites the session
+> the two graded commands run on.** There is no delete, no undo and no history:
+> overwrite is the entire lifecycle of this endpoint. The
+> `linkedin-profile-api` client is one service account and therefore **one**
+> subject, so every caller holding the published secret shares a single vault
+> row — the pre-seeded one. Storing your own cookie through it replaces that
+> row for everybody, and the two commands in [Quick start](#quick-start) then
+> run under your cookie instead of the working one.
+>
+> **So against `https://shreyaskaushik.dpdns.org`, the honest advice is to leave
+> the evaluator lane alone.** Read the section, and run it locally if you want
+> to see it work.
+>
+> The realm does ship a second service account — `linkedin-profile-api-second-caller`,
+> a different subject and therefore a different vault row — but **its secret is
+> published nowhere**, so it is not a way around this on the deployed host. The
+> two-caller demonstration is **local-only**, where `.env` holds both secrets:
+> [Prove the isolation](docs/usage.md#prove-the-isolation-two-callers-two-sessions).
+
 `last_use_ok: true` is not decoration — the service spent one call on LinkedIn's
 `me` endpoint with the cookie you just sent, so `true` means it works right now.
 Everything the endpoint does, and deliberately does not do, is under
@@ -156,9 +172,14 @@ app/linkedin/client.py  the Voyager client — the ONLY place that puts a Linked
                         session on the wire or knows the endpoint map
 app/mapping/            raw entities to the response schema, and the
                         absent-versus-unreadable decision that fills partial[]
-tests/                  the offline matrices, plus two opt-in live checks
+tests/                  the offline matrices, plus 17 opt-in live checks that
+                        are skipped by default — 1 against LinkedIn, 16 against
+                        a real Postgres
 deploy/                 realm export, nginx site, host-firewall script, runbook
 docs/                   the companion documents below
+_bmad-output/           the planning trail this was built from — brief, SPEC,
+                        the nine story files, and response-schema.md, the wire
+                        contract the mapper and error taxonomy are written to
 docker-compose.yml      api + keycloak + postgres, healthchecked, loopback-only
 Dockerfile, .env.example, .gitleaks.toml
 ```
@@ -177,9 +198,15 @@ Dockerfile, .env.example, .gitleaks.toml
 
 ### Requirements
 
-Docker and Docker Compose. Nothing else — not even a Python interpreter.
-Development, tests and the running service all happen inside containers, so the
-host's Python version is irrelevant.
+**To run the service:** Docker and Docker Compose, and nothing else. Development,
+tests and the running service all happen inside containers, so no Python is
+installed on the host and the host's Python version is irrelevant to them.
+
+**To run the commands in this README:** `curl` and `python3`, both of which
+macOS and every mainstream Linux ship by default. `python3` is used only to
+pretty-print JSON and to pull `access_token` out of the token response — it
+never runs a line of this project's code. Nothing here is installed, cloned or
+sourced to make the two graded commands work.
 
 Verified against Docker 29.2.1 / Compose v5.0.2 on `linux/arm64`
 (Apple Silicon locally, Oracle Ampere A1 deployed). All three images are native
@@ -197,22 +224,37 @@ command; everything from there is in [`docs/usage.md`](docs/usage.md).
 
 ### Configuration
 
-All configuration arrives through environment variables, read once through a
-single `pydantic-settings` object in `app/config.py`. The same image runs
+All configuration arrives through environment variables. The same image runs
 locally and deployed; only `.env` differs. There is no `APP_ENV` and no code
 path that branches on an environment name. `.env.example` lists every variable
 with a placeholder and the stack boots on those placeholders — which is the
 point, and also the risk, because every one of them is in this repository.
 
+`.env` feeds two different consumers, and they are worth keeping apart.
+
+**Read by the API**, once, through the single `pydantic-settings` object in
+`app/config.py`. These eight are the whole of what `Settings` declares — seven
+required and non-blank, one optional:
+
 | Variable | What it is |
 |---|---|
-| `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | The single source of truth for the database; the `api` service composes `DATABASE_URL` from these three, so you do not re-edit it after changing the password. `DATABASE_URL` itself matters only outside compose |
-| `KEYCLOAK_ADMIN_USERNAME`, `KEYCLOAK_ADMIN_PASSWORD` | Bootstrap admin for the Keycloak console |
-| `KEYCLOAK_REALM`, `KEYCLOAK_SERVER_URL`, `KEYCLOAK_ISSUER_URL` | The realm and its two URLs. A token's `iss` must equal `$KEYCLOAK_ISSUER_URL/realms/$KEYCLOAK_REALM` **exactly**, so mint through the same URL the API advertises |
-| `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET` | The confidential client the evaluator lane uses |
-| `KEYCLOAK_SECOND_CLIENT_ID`, `KEYCLOAK_SECOND_CLIENT_SECRET` | A second service account, which exists only so per-caller isolation is demonstrable |
+| `DATABASE_URL` | DBAPI URL for the Postgres instance. Inside compose the `api` service composes it from the three `POSTGRES_*` values and injects it, overriding this line — so the two cannot drift, and the line in `.env` matters only if you run the app outside compose |
+| `KEYCLOAK_SERVER_URL`, `KEYCLOAK_ISSUER_URL` | The same Keycloak from two sides: where *this process* fetches the realm JWKS, and the external base URL callers mint through. A token's `iss` must equal `$KEYCLOAK_ISSUER_URL/realms/$KEYCLOAK_REALM` **exactly**, so mint through the same URL the API advertises |
+| `KEYCLOAK_REALM` | The realm whose tokens this API accepts |
+| `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET` | The confidential client the evaluator lane uses; the id is also the audience every token is validated against |
 | `SESSION_ENCRYPTION_KEY` | Must be a real Fernet key — 32 bytes, url-safe base64, not a passphrase. Validated at import; the API refuses to start on anything else, because a service that cannot encrypt must not accept a cookie |
 | `LINKEDIN_DEV_COOKIE` | The one optional variable, and it **must be left blank in any deployment**. A developer's own `li_at`, read only by the opt-in live check; compose blanks it for the `api` container |
+
+**Read by compose, never by `Settings`.** These configure the `postgres` and
+`keycloak` services and the realm import. The API never sees them — it is
+`extra="ignore"`, precisely so compose can inject them without the container
+refusing to start:
+
+| Variable | What it is |
+|---|---|
+| `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | The single source of truth for the database; the `api` service composes `DATABASE_URL` from these three, so you do not re-edit it after changing the password |
+| `KEYCLOAK_ADMIN_USERNAME`, `KEYCLOAK_ADMIN_PASSWORD` | Bootstrap admin for the Keycloak console |
+| `KEYCLOAK_SECOND_CLIENT_ID`, `KEYCLOAK_SECOND_CLIENT_SECRET` | A second service account, substituted into the realm import, which exists only so per-caller isolation is demonstrable locally |
 
 Replace at minimum `POSTGRES_PASSWORD`, `KEYCLOAK_ADMIN_PASSWORD`,
 `KEYCLOAK_CLIENT_SECRET` and `SESSION_ENCRYPTION_KEY`; generate a key with
@@ -244,7 +286,7 @@ three URLs live under `http://127.0.0.1:8000`.
 
 | Route | What it does | Auth |
 |---|---|---|
-| `GET /api/v1/profile?url=…` | **The graded endpoint.** Takes a LinkedIn profile URL as the `url` query parameter, returns the profile as structured JSON. Six live calls to LinkedIn per request, or the last good record if a retryable failure gets in the way | Bearer |
+| `GET /api/v1/profile?url=…` | **The graded endpoint.** Takes a LinkedIn profile URL as the `url` query parameter, returns the profile as structured JSON. Six live calls to LinkedIn per request in the normal case — a refused core decoration or a `403` needing a `me` probe can add a seventh — or the last good record if a retryable failure gets in the way | Bearer |
 | `PUT /api/v1/session` | Store or replace your `li_at`. Body `{"li_at": "..."}`. Encrypted at rest, bound to your token's `sub`, verified once against LinkedIn's `me` endpoint on the way in. Overwrite is the entire lifecycle — there is no delete | Bearer |
 | `GET /api/v1/session` | Whether you have a session stored, when, and whether its last use worked. **Never returns the cookie**, under any flag | Bearer |
 | `GET /health` | Liveness. `{"status":"ok"}`. Checks no dependencies, by design — it is what the container healthcheck and the load-balancer probe call, and neither has a token | None |
@@ -314,13 +356,25 @@ stack trace:
 ```
 
 `code` is a stable machine-readable string, `message` is for a human, and
-`retryable` says whether repeating the request could plausibly succeed. The
-codes: `400 INVALID_URL`, `401 UNAUTHENTICATED`, `404 PROFILE_NOT_FOUND`,
-`405 METHOD_NOT_ALLOWED`, `422 INVALID_REQUEST`, `428 NO_SESSION` /
-`428 SESSION_EXPIRED`, `429 RATE_LIMITED`, `502 UPSTREAM_CHALLENGE` /
-`502 UPSTREAM_ERROR`, `503 SERVICE_UNAVAILABLE`, `500 INTERNAL_ERROR`. The full
+`retryable` says whether repeating the request could plausibly succeed.
+
+**The taxonomy** — the eight codes this service raises deliberately, from
+`response-schema.md`: `400 INVALID_URL`, `401 UNAUTHENTICATED`,
+`404 PROFILE_NOT_FOUND`, `428 NO_SESSION` / `428 SESSION_EXPIRED`,
+`429 RATE_LIMITED`, `502 UPSTREAM_CHALLENGE` / `502 UPSTREAM_ERROR`. The full
 table, with the condition behind each, is under
 [Fetch a profile](docs/usage.md#fetch-a-profile).
+
+**The fallbacks**, which are not taxonomy rows but wear the same envelope,
+because a status reachable without any route of ours agreeing to it still has to
+answer in the contract's shape: `400 BAD_REQUEST` (FastAPI's own body-read
+guard, on bytes that will not decode), `404 NOT_FOUND` (no such path —
+`GET /nope` answers it live), `405 METHOD_NOT_ALLOWED`, `422 INVALID_REQUEST`
+(request validation), `503 SERVICE_UNAVAILABLE` (this service cannot reach its
+own datastore) and `500 INTERNAL_ERROR` (a bug here). They are listed in
+`app/errors.py` as `FALLBACK_CODES`, separately from `ERROR_SPECS`, and the
+separation is deliberate: inventing a taxonomy row for "our own Postgres is
+down" would put the wire contract and the code out of agreement.
 
 **Branch on `retryable`, not on the code** — it is a property of the *response*,
 and there is one condition where the same code carries the opposite flag
@@ -366,19 +420,25 @@ cost — 400–700 MB of Chromium per request on the one instance that exists �
 kept as a fallback and demoted from Must to Could. **It was never built, and
 there is no Playwright, Selenium or Chromium anywhere in this repository**;
 saying so plainly beats leaving a reader to infer a fallback that does not
-exist. One fetch is **six** calls — the core profile, then five concurrent
-section calls, each asking `count=100` rather than the default 20, found the
-hard way when a profile with 33 skills returned 20 of them with a `200`. There
-is no retry: the failures worth retrying are the ones an immediate retry makes
-worse.
+exist. One fetch is **six** calls in the normal case — the core profile, then
+five concurrent section calls, each asking `count=100` rather than the default
+20, found the hard way when a profile with 33 skills returned 20 of them with a
+`200`. There is no retry: the failures worth retrying are the ones an immediate
+retry makes worse. Two documented paths add a seventh and neither is a retry of
+a failure — a refused core decoration is re-requested once without it, and a
+`403` that is not a wall spends one memoized call on `me` to tell a missing
+member from a dead cookie.
 
 **Staleness — answer, or explain why not.** Every successful answer is stored,
 and when a live retrieval fails for a reason retrying could fix, the last good
 record is returned with `stale: true` and the original `fetched_at`. Three
 properties keep that honest: only retryable failures fall back, so a dead
-session is a `428` and not a comfortable `200`; the record is served exactly as
-stored, so "this was true once, at this timestamp" is a checkable claim; and it
-is **unbounded** — no TTL, no eviction, no delete. The rejected alternative was
+session that LinkedIn *states* as a refusal is a `428` and not a comfortable
+`200` — but not every dead session is stated, and the one that arrives as an
+authwall is classified retryable and *is* stale-served, which is a named
+limitation below rather than a footnote to this claim; the record is served
+exactly as stored, so "this was true once, at this timestamp" is a checkable
+claim; and it is **unbounded** — no TTL, no eviction, no delete. The rejected alternative was
 a TTL, which converts "old but dated answer" into "error", the exact failure
 this design exists to avoid.
 
@@ -484,12 +544,14 @@ call and 3 on an identical call minutes later, HTTP 200 both times.
 [Full entry](docs/limitations.md#the-voyager-endpoint-map-is-undocumented-unversioned-and-verified-against-one-profile).
 
 **Stale-serve is unbounded.** No TTL, no eviction, no delete endpoint: a record
-from any point in the past is served in preference to a retryable error, the
-table grows by roughly 7 KB per distinct profile ever fetched, and the only way
-to drop one is `docker compose down -v` — which also destroys the realm and
-every stored session. So a deletion request cannot be honoured short of dropping
-everything, and a profile whose owner has since made it private keeps being
-republished.
+from any point in the past is served in preference to a retryable error, and the
+table grows by roughly 2 KB to 20 KB per distinct profile ever fetched,
+depending on how much that member has published. **Nothing in the application
+ever removes a record**, so the only ways to drop one are outside it:
+`docker compose down -v`, which also destroys the realm and every stored
+session, or a `DELETE` you run yourself in `psql`. So a deletion request cannot
+be honoured through the API at all, and a profile whose owner has since made it
+private keeps being republished.
 [Full entry](docs/limitations.md#the-cache-grows-without-bound-and-nothing-can-remove-one-record).
 
 The rest, one line each:

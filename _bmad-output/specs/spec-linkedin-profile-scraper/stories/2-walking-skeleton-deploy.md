@@ -45,7 +45,7 @@ context:
 | Plain HTTP | `http://.../health` | Redirected to HTTPS | 301 |
 | Host firewall shut | 80/443 rejected by host iptables | LB backend marked unhealthy while every OCI console setting reads correct | Open both layers; verify from off-host |
 | Origin cert missing | Cloudflare set to Full (strict) | Cloudflare returns 526 rather than serving plaintext | Install cert + key before switching the mode |
-| Container exposure | Probe instance `10.0.1.173:8000` from another host | Refused — only nginx listens off-loopback | Loopback bindings unchanged |
+| Container exposure | Probe instance `<INSTANCE_PRIVATE_IP>:8000` from another host | Refused — only nginx listens off-loopback | Loopback bindings unchanged |
 | Reboot | Instance restarts | nginx, Docker, the stack and the firewall rules all return unaided | `restart: unless-stopped`, enabled units, persisted iptables |
 
 </frozen-after-approval>
@@ -54,10 +54,10 @@ context:
 
 Verified on the instance this session — several SPEC statements were wrong and are corrected here.
 
-- Host `instance-20260827-1151`, `VM.Standard.A1.Flex`, ap-mumbai-1, **Ubuntu 24.04.4 aarch64, 4 KB pages** (the 64 KB page-size risk does not apply), 11.9 GB RAM, passwordless sudo.
-- Reached as `oci-docker` in `~/.ssh/config` — `ProxyJump oci-jump` (80.225.240.74), user `ubuntu`, `~/.ssh/id_rsa`.
+- A `VM.Standard.A1.Flex` shape, **Ubuntu 24.04.4 aarch64, 4 KB pages** (the 64 KB page-size risk does not apply). Instance hostname and region redacted.
+- Reached as `<INSTANCE>`, a local `~/.ssh/config` alias whose `ProxyJump` names a bastion; user `ubuntu`. The bastion's address is redacted.
 - **Docker and nginx are NOT installed**, contradicting SPEC's "host-installed". Both are this story's work.
-- Instance has **no public IP**: `10.0.1.173/24`, egress via NAT (`129.154.237.13`). The load balancer is the only public path.
+- Instance has **no public IP**: `<INSTANCE_PRIVATE_IP>` on the VCN subnet, egress via NAT (`<NAT_EGRESS_IP>`). The load balancer is the only public path.
 - Host iptables ends in `-A INPUT -j REJECT --reject-with icmp-host-prohibited` with only 22 accepted above it — new rules must be **inserted before** that REJECT, not appended.
 - `shreyaskaushik.dpdns.org` uses Cloudflare nameservers (`jerry`/`maria.ns.cloudflare.com`) and currently resolves to **no A record**.
 - `../../../../docker-compose.yml`, `../../../../Dockerfile` — deployed unchanged from story 1.
@@ -106,7 +106,7 @@ The human configured Cloudflare, the load balancer and the certificate, then re-
 
 The committed nginx config was therefore wrong in two ways and would have broken the site: it listened on 443 with an origin certificate on a port the firewall does not open, and it 301-redirected port 80 to HTTPS — a redirect that loops forever, because nginx sees `http` on a request the client made over HTTPS. Rewritten for termination at the load balancer.
 
-**The load-balancer health check was the real trap, and it fired.** With nginx's default site the probe got the welcome page's 200 and the backend was healthy. Installing the real site made `GET /` proxy to the API, which 404s — the backend went unhealthy and every public request became a 502 while nginx, Docker and the API were all fine. The access log named it exactly: `10.0.0.60 "GET / HTTP/1.1" 404`. Fixed with an exact-match `location = /` proxying to the API's `/health`, so the check stays truthful rather than returning a static 200 that would report a dead backend as healthy.
+**The load-balancer health check was the real trap, and it fired.** With nginx's default site the probe got the welcome page's 200 and the backend was healthy. Installing the real site made `GET /` proxy to the API, which 404s — the backend went unhealthy and every public request became a 502 while nginx, Docker and the API were all fine. The access log named it exactly: the load balancer's VCN address, `"GET / HTTP/1.1" 404`. Fixed with an exact-match `location = /` proxying to the API's `/health`, so the check stays truthful rather than returning a static 200 that would report a dead backend as healthy.
 
 Verified live from outside the network: `/health` 200, both graded curl commands work over the public name, the minted token carries `iss: https://shreyaskaushik.dpdns.org/realms/linkedin`, only nginx listens off-loopback, docker/nginx/containerd all enabled, containers `unless-stopped`, and the port-80 ACCEPT is in the saved `rules.v4` so it survives a reboot.
 
@@ -124,7 +124,7 @@ Verified live from outside the network: `/health` 200, both graded curl commands
 - `curl -fsS https://shreyaskaushik.dpdns.org/health` — expected: `{"status":"ok"}`
 - `curl -sI http://shreyaskaushik.dpdns.org/health` — expected: a 301 to the HTTPS URL
 - `curl -sv https://shreyaskaushik.dpdns.org/health 2>&1 | grep -i "issuer\|subject"` — expected: a valid chain, no verification error
-- `ssh oci-docker 'sudo iptables -S INPUT'` — expected: ACCEPT for 80 and 443 listed above the REJECT
-- `ssh oci-docker 'docker compose ps'` — expected: all three services healthy
-- `ssh oci-docker 'ss -tlnp'` — expected: nginx on `0.0.0.0:80/443`; 8000, 8080, 5432 on `127.0.0.1` only
-- `ssh oci-docker 'sudo systemctl is-enabled docker nginx'` — expected: `enabled` for both
+- `ssh <INSTANCE> 'sudo iptables -S INPUT'` — expected: ACCEPT for 80 and 443 listed above the REJECT
+- `ssh <INSTANCE> 'docker compose ps'` — expected: all three services healthy
+- `ssh <INSTANCE> 'ss -tlnp'` — expected: nginx on `0.0.0.0:80/443`; 8000, 8080, 5432 on `127.0.0.1` only
+- `ssh <INSTANCE> 'sudo systemctl is-enabled docker nginx'` — expected: `enabled` for both

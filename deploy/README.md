@@ -17,13 +17,18 @@ this instance** — see below.
 client
   → Cloudflare        DNS for shreyaskaushik.dpdns.org, proxied
     → OCI Load Balancer      HTTPS listener :443 — TLS terminates HERE
-      → instance 10.0.1.173:80        host nginx, the only public listener,
+      → instance <INSTANCE_PRIVATE_IP>:80   host nginx, the only public listener,
         → 127.0.0.1:8000              no certificate      the api container
         → 127.0.0.1:8080              keycloak (location /realms/ only)
 ```
 
+`<INSTANCE_PRIVATE_IP>` is the instance's address on the VCN subnet, and the
+placeholders below follow the same convention: every real address, hostname and
+SSH alias is redacted, because none of them is what this runbook teaches. The
+shape of the path is.
+
 The instance has **no public IP**. Its only inbound path is the load balancer;
-its egress is a NAT gateway (`129.154.237.13`). Application containers keep the
+its egress is a NAT gateway (`<NAT_EGRESS_IP>`). Application containers keep the
 loopback-only bindings they were given in `docker-compose.yml` — nothing but
 nginx answers off-loopback.
 
@@ -103,9 +108,12 @@ ACCEPT is missing, re-checks it afterwards, and deliberately does *not* persist.
 
 ## Current state of the instance
 
-Recorded 2026-08-27. Host `shreyasmkmathur-compute-vnic`, `VM.Standard.A1.Flex`,
-ap-mumbai-1, Ubuntu 24.04.4 aarch64, 11.9 GB RAM, 45 GB disk, passwordless sudo.
-Reached as `oci-docker` in `~/.ssh/config` (`ProxyJump oci-jump` → 80.225.240.74).
+Recorded 2026-08-27. A `VM.Standard.A1.Flex` shape running Ubuntu 24.04.4
+aarch64, sized for the compose stack with room to spare. Reached over SSH
+through a bastion, since the instance carries no public IP: `<INSTANCE>` below
+is a local `~/.ssh/config` alias whose `ProxyJump` names the bastion. The
+region, the instance's own hostname and every address involved are deployment
+details rather than runbook content, so they are not recorded here.
 
 Two SPEC statements were wrong and are corrected here: Docker and nginx were
 described as already "host-installed" and were not, and the 64 KB page-size risk
@@ -166,7 +174,7 @@ sections that follow are kept as the reproduction recipe, not as a to-do list.
 ## Step 1 — Host firewall
 
 ```bash
-ssh oci-docker
+ssh <INSTANCE>
 sudo bash ~/linkedin-profile-scrapper/deploy/open-ports.sh
 ```
 
@@ -174,13 +182,13 @@ It prints the chain before and after and stops short of persisting. Now, from
 the dev machine, in a **separate terminal**:
 
 ```bash
-ssh oci-docker 'echo still-in'
+ssh <INSTANCE> 'echo still-in'
 ```
 
 Only once that succeeds:
 
 ```bash
-ssh oci-docker 'sudo netfilter-persistent save'
+ssh <INSTANCE> 'sudo netfilter-persistent save'
 ```
 
 That writes `/etc/iptables/rules.v4`, which `netfilter-persistent.service`
@@ -206,7 +214,7 @@ process is listening on.
 ## Step 3 — Repo and `.env` on the instance
 
 ```bash
-ssh oci-docker
+ssh <INSTANCE>
 git clone https://github.com/shreyasY2k/linkedin-profile-scrapper.git
 cd linkedin-profile-scrapper
 ```
@@ -214,7 +222,7 @@ cd linkedin-profile-scrapper
 > While the repository is private, an unauthenticated clone fails with
 > `could not read Username for 'https://github.com'`. That is the state the
 > instance was set up in, so **its remote is the `git@` SSH URL** and pulls run
-> over a forwarded agent (`ssh -A oci-docker`), which leaves no key on the
+> over a forwarded agent (`ssh -A <INSTANCE>`), which leaves no key on the
 > instance. Do not put a GitHub credential on the host. Once the repository is
 > published, the HTTPS remote above works unauthenticated and is simpler:
 > `git remote set-url origin https://github.com/shreyasY2k/linkedin-profile-scrapper.git`.
@@ -323,7 +331,7 @@ on its own.
 ### Redeploying an existing instance
 
 ```bash
-ssh oci-docker
+ssh <INSTANCE>
 cd ~/linkedin-profile-scrapper
 git pull --ff-only
 docker compose up -d --build --wait
@@ -369,7 +377,7 @@ pre-commit run --all-files            # gitleaks is the backstop, not the plan
 
 Both are console changes.
 
-1. **OCI Load Balancer** — backend set containing `10.0.1.173` **on port 80**,
+1. **OCI Load Balancer** — backend set containing `<INSTANCE_PRIVATE_IP>` **on port 80**,
    and a single **HTTPS listener on 443** carrying the certificate. The
    listener terminates TLS and forwards plain HTTP to the backend's port 80.
    There is no port-80 listener, which is why `http://shreyaskaushik.dpdns.org`
@@ -379,7 +387,8 @@ Both are console changes.
    > Nothing on this instance speaks TLS, so a `:443` check can never pass, and
    > nothing redirects, so there is no 301 to accept. `GET /` rather than
    > `/health` because that is the path the load balancer actually requests
-   > (confirmed in the nginx access log: `10.0.0.60` requesting `/`), and
+   > (confirmed in the nginx access log: the load balancer's own VCN address
+   > requesting `/`), and
    > `location = /` in the site config proxies it to the API's `/health`. The
    > check is therefore truthful — 200 only while the API really answers, and
    > 502 the moment it does not.
@@ -390,8 +399,8 @@ Both are console changes.
    > made over HTTPS.
 
 2. **Cloudflare DNS** — an **A** record for `shreyaskaushik.dpdns.org` pointing
-   at the load balancer's public IP, **proxied** (orange cloud). The zone is on
-   Cloudflare nameservers (`jerry` / `maria.ns.cloudflare.com`).
+   at the load balancer's public IP, **proxied** (orange cloud). The zone is
+   served by the pair of Cloudflare nameservers the dashboard assigns it.
 
    Consider switching **SSL/TLS → Edge Certificates → Always Use HTTPS** on. It
    is off today, which is why plain `http://` 522s instead of redirecting.
@@ -409,7 +418,7 @@ being committed:
 |---|---|
 | `docker compose up -d --wait` from empty volumes | all three healthy in ~27 s |
 | `curl -fsS http://127.0.0.1:8000/health` | `{"status":"ok"}` |
-| Test suite (`docker build --target test`) | 925 passed, 17 skipped (the opt-in live checks) |
+| Test suite (`docker build --target test`) | 949 passed, 17 skipped — the opt-in live checks: 1 in `tests/test_linkedin_live.py`, 16 in `tests/test_postgres_live.py` |
 | `nginx -t` on the site config, nginx 1.24.0 | syntax ok |
 | The site config in front of the real API | `HTTP/1.1 200` `{"status":"ok"}` on `/health`, HSTS and nosniff present |
 | Published ports reachable off-loopback | refused on 8000, 8080 and 5432 |
@@ -440,11 +449,11 @@ there is no origin certificate to inspect.
 On the instance:
 
 ```bash
-ssh oci-docker 'sudo iptables -S INPUT'          # ACCEPT 80 ABOVE the REJECT
-ssh oci-docker 'cd linkedin-profile-scrapper && docker compose ps'   # three healthy
-ssh oci-docker 'sudo ss -tlnp'                   # nginx on 0.0.0.0:80 only;
+ssh <INSTANCE> 'sudo iptables -S INPUT'          # ACCEPT 80 ABOVE the REJECT
+ssh <INSTANCE> 'cd linkedin-profile-scrapper && docker compose ps'   # three healthy
+ssh <INSTANCE> 'sudo ss -tlnp'                   # nginx on 0.0.0.0:80 only;
                                                  # 8000, 8080, 5432 on 127.0.0.1 only
-ssh oci-docker 'sudo systemctl is-enabled docker nginx'             # enabled, enabled
+ssh <INSTANCE> 'sudo systemctl is-enabled docker nginx'             # enabled, enabled
 ```
 
 ### The reboot check — do not skip it
@@ -453,10 +462,10 @@ The acceptance criterion is that the instance comes back unaided. It is also the
 only real test that the firewall rules were persisted and not merely applied.
 
 ```bash
-ssh oci-docker 'sudo systemctl reboot'
+ssh <INSTANCE> 'sudo systemctl reboot'
 # wait ~60s
 curl -fsS https://shreyaskaushik.dpdns.org/health
-ssh oci-docker 'sudo iptables -S INPUT'
+ssh <INSTANCE> 'sudo iptables -S INPUT'
 ```
 
 The `/health` call must succeed with no manual step in between.

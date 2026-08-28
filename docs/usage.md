@@ -53,12 +53,18 @@ TOKEN=$(curl -fsS -X POST \
   "$KEYCLOAK_ISSUER_URL/realms/$KEYCLOAK_REALM/protocol/openid-connect/token" \
   | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
 
-curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/api/v1/...
+curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/api/v1/...
 ```
 
 With the defaults in `.env.example` those expand to realm `linkedin`, client
 `linkedin-profile-api`, and a token endpoint at
 `http://127.0.0.1:8080/realms/linkedin/protocol/openid-connect/token`.
+
+**`-sS` on the API calls, `-fsS` on the mint.** `curl -f` discards the response
+body on a 4xx or 5xx and exits 22, which on this API throws away the one thing
+worth reading — the typed error envelope. So every `/api/v1` call below drops
+the `-f`, and only the token mint and `/health`, which have no envelope to show
+you, keep it. The README's graded profile fetch follows the same rule.
 
 **The graded lane is the public host, not this one.** The two commands in the
 README's [Quick start](../README.md#quick-start) are the ones the submission is
@@ -155,7 +161,7 @@ TOKEN=$(curl -fsS -X POST \
 read -rs -p 'Paste your li_at: ' LI_AT; echo   # -s: not echoed, not in history
 
 LI_AT="$LI_AT" python3 -c 'import json,os;print(json.dumps({"li_at":os.environ["LI_AT"]}))' \
-  | curl -fsS -X PUT \
+  | curl -sS -X PUT \
       -H "Authorization: Bearer $TOKEN" \
       -H 'content-type: application/json' \
       --data-binary @- \
@@ -186,7 +192,7 @@ you the credential.
 Check it later without re-sending it:
 
 ```bash
-curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/api/v1/session
+curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/api/v1/session
 # {"stored":true,"stored_at":"...","last_used_at":null,"last_use_ok":null}
 ```
 
@@ -230,7 +236,7 @@ TOKEN=$(curl -fsS -X POST \
   "$KEYCLOAK_ISSUER_URL/realms/$KEYCLOAK_REALM/protocol/openid-connect/token" \
   | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
 
-curl -fsS -G http://127.0.0.1:8000/api/v1/profile \
+curl -sS -G http://127.0.0.1:8000/api/v1/profile \
   -H "Authorization: Bearer $TOKEN" \
   --data-urlencode 'url=https://www.linkedin.com/in/example'
 ```
@@ -239,7 +245,8 @@ curl -fsS -G http://127.0.0.1:8000/api/v1/profile \
 profile URL carries `?trk=...` tracking parameters and sometimes non-ASCII
 public ids, and both need encoding to survive as a query value.
 
-The answer is the envelope from `response-schema.md`:
+The answer is the envelope from
+[`response-schema.md`](../_bmad-output/specs/spec-linkedin-profile-scraper/response-schema.md):
 
 ```json
 {
@@ -356,12 +363,18 @@ Every one of these is `Cache-Control: no-store`, including the successful
 response: these bodies are specific to *you*, and a shared cache in front of the
 service keys on nothing that distinguishes one caller from another.
 
-Each request costs **six** live calls to LinkedIn: one for the core profile,
-then five concurrent section calls. There is no retry — the failures worth
-retrying are the ones an immediate retry makes worse. (One exception, and it is
-not a retry of a failure: if LinkedIn refuses the decoration the core request
-asks for, that one call is repeated without it, and the profile comes back
-without a `region`. A brittle nicety must not take down the fetch.)
+Each request costs **six** live calls to LinkedIn in the normal case: one for
+the core profile, then five concurrent section calls. There is no retry — the
+failures worth retrying are the ones an immediate retry makes worse. Two
+documented paths add a seventh, and neither is a retry of a failure:
+
+- If LinkedIn refuses the decoration the core request asks for, that one call is
+  repeated without it, and the profile comes back without a `region`. A brittle
+  nicety must not take down the fetch.
+- If a profile resource answers `403` and the response is not a wall, the client
+  spends one call on `me` to decide whether the refusal is about the member or
+  about the cookie (commit `33b4fad`). It is memoized per request, so it happens
+  at most once however many sections refuse.
 
 Each call has a 15s timeout and the whole fetch has a 45s backstop, so a wedged
 upstream cannot hold a request open indefinitely.
@@ -433,7 +446,7 @@ with a record in the cache:
 | Any of the three | no | the typed error, unchanged |
 | Any of the three, but the cache itself could not be read | — | the typed error, unchanged |
 | Any of the three, but the record is unreadable or was written under an older response shape | — | the typed error, unchanged |
-| Your session died (`SESSION_EXPIRED`) | yes | `428` — never a stale 200. **See the gap below.** |
+| Your session died (`SESSION_EXPIRED`) | yes | `428` — never a stale 200, **when LinkedIn states the refusal.** A dead cookie that draws an authwall instead is classified `UPSTREAM_CHALLENGE` and *is* stale-served: **see the gap below**, which is not a footnote to this row but a limit on it |
 | You stored no session (`NO_SESSION`) | yes | `428`, and the record is not even looked up |
 | No or invalid bearer token (`UNAUTHENTICATED`) | yes | `401`, before this endpoint runs at all |
 | Profile gone or hidden (`PROFILE_NOT_FOUND`) | yes | `404` — a deleted profile is not stale data |
@@ -512,6 +525,15 @@ service-account user, so each mints a token with a different `sub`. The client
 in `KEYCLOAK_CLIENT_ID` is the evaluator lane; `KEYCLOAK_SECOND_CLIENT_ID`
 exists only to be a second caller.
 
+> **This demonstration is local-only, and deliberately so.** The second client
+> exists in the deployed realm too, but **its secret is published nowhere** — so
+> there is no way to run this section against
+> `https://shreyaskaushik.dpdns.org`, and no reason to try. Against the deployed
+> host the only client whose secret you hold is the evaluator lane, and storing
+> a cookie through it **overwrites the pre-seeded session the two graded
+> commands depend on**, with no delete and no undo. Run this locally, where the
+> stack is yours and `.env` holds both secrets.
+
 > **Needs a cold volume.** The realm import strategy is `IGNORE_EXISTING`, so a
 > stack whose `pgdata` volume predates this section already has the old
 > single-client realm and will never see the second one. Run
@@ -544,13 +566,17 @@ subject_of "$A"
 subject_of "$B"
 
 # A stores a session; B has none and cannot even see that A does.
+read -rs -p 'Paste your li_at: ' LI_AT; echo   # -s: not echoed, not in history
+
 LI_AT="$LI_AT" python3 -c 'import json,os;print(json.dumps({"li_at":os.environ["LI_AT"]}))' \
-  | curl -fsS -X PUT -H "Authorization: Bearer $A" \
+  | curl -sS -X PUT -H "Authorization: Bearer $A" \
       -H 'content-type: application/json' --data-binary @- \
       http://127.0.0.1:8000/api/v1/session
 
-curl -fsS -H "Authorization: Bearer $B" http://127.0.0.1:8000/api/v1/session
+curl -sS -H "Authorization: Bearer $B" http://127.0.0.1:8000/api/v1/session
 # {"stored":false,...}   <- B sees its own state, and only its own
+
+unset LI_AT
 ```
 
 Two rows, two subjects, and neither token can read the other's value — because
@@ -559,9 +585,12 @@ rather than from anything a caller can type.
 
 ## The live check
 
-Everything in the test suite runs offline against synthetic fixtures. One test
-does not: `tests/test_linkedin_live.py` calls the real Voyager API, to prove the
-endpoint map is still real. LinkedIn's internal API is unversioned and
+Everything in the test suite runs offline against synthetic fixtures. Seventeen
+tests are skipped by default because they are not offline, and they live in two
+files: the **one** in `tests/test_linkedin_live.py`, which is the subject of this
+section, and sixteen in `tests/test_postgres_live.py`, the opt-in database
+round-trip. The LinkedIn one calls the real Voyager API, to prove the endpoint
+map is still real. LinkedIn's internal API is unversioned and
 undocumented — the endpoint most documentation still names is already `410
 Gone` — so this is the only assertion that can fail for a reason no offline test
 can predict.
@@ -720,4 +749,3 @@ locally never reaches the running process's environment.
 `.env` is gitignored and was gitignored in the commit that created the
 repository. No credential, cookie, key or secret belongs anywhere in this tree
 or in its history.
-

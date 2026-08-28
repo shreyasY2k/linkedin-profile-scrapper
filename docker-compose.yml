@@ -78,7 +78,10 @@ services:
       # Health endpoints live on the management port (9000) and are off unless
       # this is set.
       KC_HEALTH_ENABLED: "true"
-      # nginx terminates TLS in front (story 2); Keycloak needs no change there.
+      # TLS terminates at the OCI load balancer, which holds the certificate;
+      # host nginx holds none and speaks plain HTTP to this container. So
+      # Keycloak serves HTTP and trusts X-Forwarded-* to reconstruct the
+      # public scheme it puts in `iss` — see deploy/README.md.
       KC_HTTP_ENABLED: "true"
       KC_HOSTNAME_STRICT: "false"
       KC_PROXY_HEADERS: xforwarded
