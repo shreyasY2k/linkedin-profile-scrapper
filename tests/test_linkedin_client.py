@@ -178,6 +178,31 @@ def override(name: str, outcome: Any) -> list[tuple[str, Any]]:
     return [(resource, outcome), *routes]
 
 
+def with_me(routes: list[tuple[str, Any]], outcome: Any) -> list[tuple[str, Any]]:
+    """Replace what `me` answers. `me` is the only resource the 403 probe calls."""
+    return [("/api/me", outcome), *[(m, o) for m, o in routes if m != "/api/me"]]
+
+
+#: A member who does not exist, exactly as LinkedIn answers one. Captured live
+#: on 2026-08-27 from `identity/dash/profiles?q=memberIdentity&memberIdentity=`
+#: with a made-up id: **403**, JSON, and indistinguishable by status alone from
+#: the 403 a dead cookie draws.
+def absent_member_response() -> VoyagerResponse:
+    return json_response(
+        {
+            "data": {
+                "exceptionClass": (
+                    "com.linkedin.voyager.common.VoyagerUserVisibleException"
+                ),
+                "message": "This profile can't be accessed",
+                "status": 403,
+            },
+            "included": [],
+        },
+        status=403,
+    )
+
+
 def make_client(routes: list[tuple[str, Any]] | None = None, **kwargs: Any) -> VoyagerClient:
     transport = FakeTransport(routes if routes is not None else happy_routes())
     client = VoyagerClient(SENTINEL_COOKIE, transport=transport, **kwargs)
@@ -824,13 +849,185 @@ def test_an_unsafe_jsessionid_is_a_loud_bug_not_a_session_error(value: str) -> N
 
 @pytest.mark.parametrize("status", [401, 403])
 def test_a_refused_cookie_is_session_expired(status: int) -> None:
-    client = make_client(override("core", status_response(status)))
+    """The dead-cookie case, and the one this must never stop reporting.
+
+    `me` refuses alongside the profile resource, which is what a dead cookie
+    actually looks like: the refusal is account-wide, so every call gets it.
+    A 401 needs no corroboration; a 403 does, because LinkedIn spends that
+    status on a missing member as well — see the probe tests below.
+    """
+    client = make_client(
+        with_me(override("core", status_response(status)), status_response(status))
+    )
 
     error = expect_api_error(lambda: fetch(client))
 
     assert error.code == "SESSION_EXPIRED"
     assert error.spec.status_code == 428
     assert error.spec.retryable is False
+
+
+# --- A 403 is two different facts, and `me` is the discriminator ---------------
+#
+# LinkedIn answers 403 both for a cookie it has stopped accepting and for a
+# member who does not exist. Reading every 403 as the first told a caller with a
+# perfectly healthy session to go and replace their cookie because they typed a
+# URL that was never real. `me` describes the session's own owner and nothing
+# else, so it is the one call that can tell the two apart.
+
+
+def test_a_403_with_a_healthy_me_is_the_member_not_the_session() -> None:
+    """The made-up URL a grader will try. 404, and not a word about the cookie."""
+    client = make_client(override("core", absent_member_response()))
+
+    error = expect_api_error(lambda: fetch(client))
+
+    assert error.code == "PROFILE_NOT_FOUND"
+    assert error.spec.status_code == 404
+    assert error.spec.retryable is False
+    assert error.code != "SESSION_EXPIRED", "the cookie is healthy and must not be blamed"
+
+
+def test_a_403_with_a_dead_me_stays_session_expired() -> None:
+    """The regression this change is most likely to cause, asserted directly.
+
+    A genuinely expired cookie draws a 403 on the profile *and* on `me`. If the
+    probe's verdict were ever read the wrong way round, this is the case that
+    would silently become a 404 — telling a caller their session is fine and the
+    profile does not exist, when the truth is the exact opposite.
+    """
+    client = make_client(
+        with_me(override("core", absent_member_response()), status_response(403))
+    )
+
+    error = expect_api_error(lambda: fetch(client))
+
+    assert error.code == "SESSION_EXPIRED"
+    assert error.spec.status_code == 428
+
+
+def test_a_403_with_a_walled_me_stays_session_expired() -> None:
+    """Story 8's rule, reused rather than re-decided.
+
+    A wall on `me` IS evidence about the cookie, because no third party's
+    visibility can explain it. `check_session` already encodes that, and the
+    probe inherits it by calling `check_session` instead of reimplementing it.
+    """
+    client = make_client(
+        with_me(
+            override("core", absent_member_response()),
+            html_response(status=200, url="https://www.linkedin.com/authwall"),
+        )
+    )
+
+    assert expect_api_error(lambda: fetch(client)).code == "SESSION_EXPIRED"
+
+
+@pytest.mark.parametrize(
+    "me_outcome",
+    [
+        status_response(429),
+        status_response(500),
+        status_response(200, body=b"not json at all"),
+        TransportError("connection reset"),
+    ],
+    ids=["throttled", "upstream-error", "unparseable", "transport-failure"],
+)
+def test_an_inconclusive_me_probe_keeps_the_standing_verdict(me_outcome: Any) -> None:
+    """A probe that learned nothing must not be read as a probe that learned "alive".
+
+    Deliberately conservative: SESSION_EXPIRED is the behaviour that has been
+    shipping, so an unclassifiable case degrades to it rather than to a fresh
+    guess about somebody's cookie. Every one of these four is a way the probe
+    can fail to reach a verdict, and none of them is evidence the member is
+    absent.
+    """
+    client = make_client(
+        with_me(override("core", absent_member_response()), me_outcome)
+    )
+
+    assert expect_api_error(lambda: fetch(client)).code == "SESSION_EXPIRED"
+
+
+def test_a_401_is_never_reconsidered_and_costs_no_probe() -> None:
+    """401 is unambiguous. Spending a live call to confirm it would be waste."""
+    client = make_client(
+        with_me(
+            override("core", status_response(401)),
+            AssertionError("the probe must not run for a 401"),
+        )
+    )
+
+    error = expect_api_error(lambda: fetch(client))
+
+    assert error.code == "SESSION_EXPIRED"
+    assert not [url for url in client.transport.urls if url.endswith("/api/me")]  # type: ignore[attr-defined]
+
+
+def test_a_walled_403_is_not_reconsidered() -> None:
+    """An authwall says nothing about the member, so it cannot make one absent.
+
+    LinkedIn serves the wall to healthy sessions coming from a datacenter IP,
+    which is what this service is. Turning that into PROFILE_NOT_FOUND would
+    invent a fact about a person out of scenery, so the standing verdict holds
+    and no probe is spent asking.
+    """
+    client = make_client(
+        override("core", html_response(status=403, url="https://www.linkedin.com/authwall"))
+    )
+
+    error = expect_api_error(lambda: fetch(client))
+
+    assert error.code == "SESSION_EXPIRED"
+    assert not [url for url in client.transport.urls if url.endswith("/api/me")]  # type: ignore[attr-defined]
+
+
+def test_the_bogus_profile_case_costs_exactly_one_probe() -> None:
+    """Two calls: the core that 403'd, and the single `me` that explained it."""
+    client = make_client(override("core", absent_member_response()))
+
+    expect_api_error(lambda: fetch(client))
+    urls = client.transport.urls  # type: ignore[attr-defined]
+
+    assert len(urls) == 2, urls
+    assert [url for url in urls if url.endswith("/api/me")] == [
+        "https://www.linkedin.com/voyager/api/me"
+    ]
+    assert client.call_count == 2
+
+
+def test_five_concurrent_section_403s_still_cost_one_probe() -> None:
+    """The bound that needs enforcing, because the sections run in parallel.
+
+    A flag alone would not hold here: all five coroutines would find it unset
+    before any of them had finished probing, and the error path would become
+    the most expensive path in the system — five extra `me` calls against an
+    account with a real quota. The memo is taken under a lock for this case.
+    """
+    routes = happy_routes()
+    routes = [
+        (resource, absent_member_response()) for resource in SECTION_RESOURCES.values()
+    ] + [(marker, out) for marker, out in routes if marker not in SECTION_RESOURCES.values()]
+    client = make_client(routes)
+
+    profile = fetch(client)
+    urls = client.transport.urls  # type: ignore[attr-defined]
+
+    assert len([url for url in urls if url.endswith("/api/me")]) == 1, urls
+    assert len(urls) == 7, "one core, five sections, one probe"
+    # A sub-resource refusing is not an account-wide fact, so it degrades to
+    # `partial[]` rather than aborting — the section fan-out's existing rule.
+    assert sorted(profile.failed_sections) == sorted(SECTION_RESOURCES)
+
+
+def test_the_probe_never_runs_on_a_success_path() -> None:
+    """It costs a live call, so it must exist only where something has failed."""
+    client = make_client()
+
+    profile = fetch(client)
+
+    assert not [url for url in client.transport.urls if url.endswith("/api/me")]  # type: ignore[attr-defined]
+    assert profile.call_count == 6
 
 
 def test_session_expiry_is_not_reported_as_a_profile_problem() -> None:

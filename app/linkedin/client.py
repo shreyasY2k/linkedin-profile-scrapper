@@ -990,6 +990,16 @@ class VoyagerClient:
         #: Live calls made by this instance. Read by tests to prove the fetch
         #: costs six and not seven.
         self.call_count = 0
+        #: Memo for :meth:`_session_is_alive`. One instance is one inbound
+        #: request (``app/api/v1/profile.py`` constructs the client per call),
+        #: so "once per client" is "once per request" — which is the bound that
+        #: matters: the five sections fan out **concurrently**, and five
+        #: simultaneous 403s must not become five ``me`` probes. The lock, not
+        #: just the flag, is what enforces that; without it every one of the
+        #: five would find the flag unset before any of them had finished.
+        self._probe_lock = asyncio.Lock()
+        self._probe_done = False
+        self._probe_verdict: bool | None = None
 
     # -- Public API ----------------------------------------------------------
 
@@ -1207,10 +1217,24 @@ class VoyagerClient:
             )
 
         if not element_urns(payload):
-            # A well-formed id that does not exist answers 200 with an empty
-            # elements list rather than a 404. Reporting that as an empty
-            # profile would be the worst possible outcome: a confident,
-            # well-formed answer about a person who is not there.
+            # A core collection with no elements names nobody, and reporting
+            # that as an empty profile would be the worst possible outcome: a
+            # confident, well-formed answer about a person who is not there.
+            #
+            # **Two paths reach PROFILE_NOT_FOUND, and they agree.** This one,
+            # and a 403 that `_reconsider_refusal` has proved is about the
+            # member rather than the cookie. An earlier version of this comment
+            # claimed a non-existent id "answers 200 with an empty elements list
+            # rather than a 404", which measurement on 2026-08-27 contradicted:
+            # a bogus `memberIdentity` answers **403**, and it was that 403 —
+            # classified as SESSION_EXPIRED — which a caller actually met.
+            #
+            # This branch is not dead, and it stopped being unreachable for a
+            # second reason: the empty core collection arrives in LinkedIn's
+            # empty form (`elements: []`, see `EMPTY_ELEMENTS_KEY`), which
+            # `is_collection_envelope` refused until the same day — so an empty
+            # core was reported as a malformed envelope and never got here at
+            # all. Both fixes were needed for this line to mean what it says.
             raise self._not_found(public_id, "core response listed zero elements")
         return payload
 
@@ -1357,8 +1381,12 @@ class VoyagerClient:
 
         try:
             return self._classify(response, resource=resource)
-        except ApiError:
-            raise
+        except ApiError as exc:
+            # The one asynchronous step in classification, and it is why it
+            # lives here rather than in `_classify`: deciding whether a 403 is
+            # about the member or about the cookie takes a second live call.
+            # Everything else about this response has already been decided.
+            raise await self._reconsider_refusal(exc, response, resource)
         except Exception as exc:
             # Classification is inside the guarantee too, and not
             # hypothetically: `json.loads` raises `RecursionError` on a deeply
@@ -1414,6 +1442,15 @@ class VoyagerClient:
             # caller would then be fed ever-older cached data forever and never
             # once told to store a new cookie. An explicit refusal outranks the
             # scenery it was delivered with.
+            #
+            # For a **403 this is the opening verdict, not the last word.**
+            # LinkedIn answers 403 both for a dead cookie and for a member who
+            # does not exist, so `_request` hands this error to
+            # `_reconsider_refusal`, which probes `me` and may refine it to
+            # PROFILE_NOT_FOUND. That step is asynchronous and this function is
+            # not, which is the whole reason it lives one level up. What is
+            # decided here is the answer that stands whenever the probe cannot
+            # improve on it — including for a 401, which is never reconsidered.
             raise ApiError(
                 "SESSION_EXPIRED",
                 log_detail=f"{resource} returned {status}; LinkedIn refused the session",
@@ -1513,6 +1550,146 @@ class VoyagerClient:
                 cause=CAUSE_MALFORMED_BODY,
             )
         return payload
+
+    # -- Is a 403 about the member, or about the cookie? ----------------------
+
+    async def _reconsider_refusal(
+        self, error: ApiError, response: VoyagerResponse, resource: str
+    ) -> ApiError:
+        """Refine a 403 ``SESSION_EXPIRED`` into ``PROFILE_NOT_FOUND``, or don't.
+
+        **Measured on 2026-08-27.** A member who does not exist does not answer
+        404. ``identity/dash/profiles?q=memberIdentity&memberIdentity=<bogus>``
+        answers **403** with a JSON body::
+
+            {"data": {"exceptionClass": "com.linkedin.voyager.common.\\
+                       VoyagerUserVisibleException",
+                      "message": "This profile can't be accessed",
+                      "status": 403}, "included": []}
+
+        A dead cookie answers 403 too. The status alone cannot separate the two,
+        and :meth:`_classify` therefore has to guess — it guesses
+        ``SESSION_EXPIRED``, which is right for the cookie and, for a made-up
+        URL, tells a caller to replace a credential that works perfectly.
+
+        The discriminator is the one story 8 already settled, applied the other
+        way round. ``me`` describes the session's OWN OWNER: no third party is
+        involved and no profile's visibility can be the explanation, so what
+        ``me`` says is evidence about the cookie and nothing else. If ``me``
+        answers healthily while a profile resource is refusing, the refusal is
+        about the member.
+
+        Three verdicts, and the third is the one that decides the shape:
+
+        * ``me`` healthy → the session is fine → ``PROFILE_NOT_FOUND`` (404).
+        * ``me`` dead or walled → ``SESSION_EXPIRED``, unchanged.
+        * **the probe could not decide** → ``SESSION_EXPIRED``, unchanged.
+
+        The default is "leave it exactly as it was". A probe that is rate
+        limited, times out or hits an upstream fault has learned nothing, and
+        the error this replaces is the behaviour that has been shipping — so an
+        unclassifiable case degrades to today's answer rather than to a fresh
+        guess about somebody's cookie.
+
+        Narrow by construction, and each condition earns its place:
+
+        * **Only a 403.** A 401 is an unambiguous refusal of the credential
+          rather than the overloaded status, and is never reconsidered.
+        * **Only where :meth:`_classify` reached ``SESSION_EXPIRED``.** This
+          refines that one verdict; it does not re-decide the response.
+        * **Never for ``me`` itself**, which is also what makes recursion
+          impossible: the probe's own call is the single resource this refuses
+          to reconsider.
+        * **Never for a 403 delivered as a wall.** An authwall says nothing
+          about the member — LinkedIn serves it to perfectly healthy sessions
+          arriving from a datacenter IP, which is what this service is. The
+          measured member-does-not-exist 403 is a JSON
+          ``VoyagerUserVisibleException``, not HTML. Reporting a wall as
+          PROFILE_NOT_FOUND would invent a fact about a person out of scenery,
+          so it keeps the standing verdict.
+        """
+        if (
+            response.status != 403
+            or resource == ME_RESOURCE
+            or error.code != "SESSION_EXPIRED"
+            or self._challenge_reason(response) is not None
+        ):
+            return error
+
+        alive = await self._session_is_alive()
+        if alive is not True:
+            logger.info(
+                "%s returned 403 and the me probe %s; keeping SESSION_EXPIRED",
+                resource,
+                "found the session dead" if alive is False else "could not decide",
+            )
+            return error
+
+        logger.info(
+            "%s returned 403 while me answered healthily — reporting the member "
+            "as not found rather than the session as expired",
+            resource,
+        )
+        return ApiError(
+            "PROFILE_NOT_FOUND",
+            log_detail=(
+                f"{resource} returned 403 and me confirmed the session is live; "
+                "the profile does not exist or is not visible to this session"
+            ),
+        )
+
+    async def _session_is_alive(self) -> bool | None:
+        """``True`` live, ``False`` dead, ``None`` could not tell. Probed once.
+
+        Memoized behind a lock so the bound is **one probe per client**, and
+        therefore one per inbound request. The bound is not decorative: the
+        five sections fan out through :func:`asyncio.gather`, so without the
+        lock a profile that 403s across the board would fire five identical
+        ``me`` calls against an account with a real quota — turning an error
+        path into the most expensive path in the system.
+
+        In practice the core call fails first and alone, so the section case is
+        the one that can only be reached if LinkedIn starts refusing
+        sub-resources it previously served. That it is unlikely is not a reason
+        to leave it unbounded.
+        """
+        async with self._probe_lock:
+            if not self._probe_done:
+                self._probe_verdict = await self._probe_session()
+                self._probe_done = True
+            return self._probe_verdict
+
+    async def _probe_session(self) -> bool | None:
+        """One ``me`` call, reusing :meth:`check_session` rather than repeating it.
+
+        ``check_session`` is already the module's answer to "is this cookie
+        alive" — including story 8's rule that a wall on ``me``, unlike a wall
+        on a profile, is evidence the session is dead. A second implementation
+        here would be a second answer to one question, and the two would drift.
+
+        It raises where this returns, so the mapping is: ``SESSION_EXPIRED``
+        means dead, any other failure means the probe learned nothing, and a
+        returned identifier means alive. Never raises: a probe that fails is an
+        inconclusive probe, not a new error for the caller — they already have
+        one, and it is the one this was trying to improve on.
+        """
+        try:
+            await self.check_session()
+        except ApiError as exc:
+            if exc.code == "SESSION_EXPIRED":
+                return False
+            logger.info(
+                "The me probe was inconclusive (%s); the 403 stays a session error",
+                exc.code,
+            )
+            return None
+        except Exception as exc:  # pragma: no cover - CAP-6 belt and braces
+            logger.warning(
+                "The me probe raised %s; the 403 stays a session error",
+                type(exc).__name__,
+            )
+            return None
+        return True
 
     def _challenge_reason(self, response: VoyagerResponse) -> str | None:
         """Why this response looks like a wall rather than data, or ``None``.
